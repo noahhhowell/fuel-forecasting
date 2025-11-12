@@ -122,6 +122,7 @@ def forecast_command(args):
             models_to_use=[args.model] if args.model else None,
             output_path=args.output,
             skip_insufficient=not args.include_all,
+            handle_outliers=not args.no_outlier_handling,
         )
 
         # Display summary
@@ -442,6 +443,11 @@ Examples:
         "--include-all",
         action="store_true",
         help="Include sites with insufficient data",
+    )
+    forecast_parser.add_argument(
+        "--no-outlier-handling",
+        action="store_true",
+        help="Disable outlier detection and capping (use raw historical values)",
     )
     forecast_parser.add_argument("--output", help="Output Excel file")
 

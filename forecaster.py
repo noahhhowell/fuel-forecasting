@@ -209,6 +209,7 @@ class FuelForecaster:
         grade: Optional[str] = None,
         models_to_use: Optional[List[str]] = None,
         monthly_data: Optional[pd.DataFrame] = None,
+        handle_outliers: bool = True,
     ) -> pd.DataFrame:
         """
         Generate forecast for a specific month
@@ -219,6 +220,7 @@ class FuelForecaster:
             grade: Specific grade (None for all)
             models_to_use: Specific models to use
             monthly_data: Pre-computed monthly data (for caching in bulk forecasts)
+            handle_outliers: Apply outlier detection and capping (default: True)
 
         Returns:
             DataFrame with forecasts from all models
@@ -236,8 +238,10 @@ class FuelForecaster:
                     f"(recommended: {check['months_required']}). Forecasting anyway."
                 )
 
-            # Prepare data with outlier handling
-            monthly_data = self.prepare_monthly_data(site_id=site_id, grade=grade)
+            # Prepare data with optional outlier handling
+            monthly_data = self.prepare_monthly_data(
+                site_id=site_id, grade=grade, handle_outliers=handle_outliers
+            )
 
         last_date = monthly_data["date"].max()
 
@@ -315,6 +319,7 @@ class FuelForecaster:
         models_to_use: Optional[List[str]] = None,
         output_path: Optional[str] = None,
         skip_insufficient: bool = True,
+        handle_outliers: bool = True,
     ) -> pd.DataFrame:
         """
         Generate forecasts for multiple configurations with progress tracking
@@ -325,6 +330,7 @@ class FuelForecaster:
             models_to_use: Specific models to use
             output_path: Output Excel file path
             skip_insufficient: Skip items with insufficient data
+            handle_outliers: Apply outlier detection and capping (default: True)
 
         Returns:
             DataFrame with all forecasts
@@ -334,7 +340,9 @@ class FuelForecaster:
 
         if by == "total":
             logger.info(f"Generating total forecast for {target_month}")
-            forecast = self.generate_forecast(target_month, models_to_use=models_to_use)
+            forecast = self.generate_forecast(
+                target_month, models_to_use=models_to_use, handle_outliers=handle_outliers
+            )
             all_forecasts.append(forecast)
 
         elif by == "grade":
@@ -347,7 +355,10 @@ class FuelForecaster:
                 logger.info(f"  [{i}/{len(grades)}] Grade: {grade}")
                 try:
                     forecast = self.generate_forecast(
-                        target_month, grade=grade, models_to_use=models_to_use
+                        target_month,
+                        grade=grade,
+                        models_to_use=models_to_use,
+                        handle_outliers=handle_outliers,
                     )
                     all_forecasts.append(forecast)
                 except Exception as e:
@@ -367,7 +378,7 @@ class FuelForecaster:
                 try:
                     # Cache monthly data (avoid recomputing in check + forecast)
                     site_monthly_data = self.prepare_monthly_data(
-                        site_id=row["site_id"]
+                        site_id=row["site_id"], handle_outliers=handle_outliers
                     )
                     months_available = len(site_monthly_data)
 
@@ -387,6 +398,7 @@ class FuelForecaster:
                         site_id=row["site_id"],
                         models_to_use=models_to_use,
                         monthly_data=site_monthly_data,
+                        handle_outliers=handle_outliers,
                     )
                     forecast["site_name"] = row["site"]
                     all_forecasts.append(forecast)
@@ -416,7 +428,9 @@ class FuelForecaster:
                 try:
                     # Cache monthly data (avoid recomputing in check + forecast)
                     combo_monthly_data = self.prepare_monthly_data(
-                        site_id=row["site_id"], grade=row["grade"]
+                        site_id=row["site_id"],
+                        grade=row["grade"],
+                        handle_outliers=handle_outliers,
                     )
                     months_available = len(combo_monthly_data)
 
@@ -438,6 +452,7 @@ class FuelForecaster:
                         grade=row["grade"],
                         models_to_use=models_to_use,
                         monthly_data=combo_monthly_data,
+                        handle_outliers=handle_outliers,
                     )
                     forecast["site_name"] = row["site"]
                     all_forecasts.append(forecast)

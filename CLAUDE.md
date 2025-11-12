@@ -72,6 +72,18 @@ Most detailed forecasts (site_grade) can take 15-30 minutes for 400 sites with 3
 - `skip_insufficient=True` (default) skips items with insufficient data
 - Skipped items are reported in Excel "Skipped" sheet with reasons
 
+### Outlier Handling
+
+- **Default behavior**: Outlier detection is ENABLED (uses MAD method with 3σ threshold)
+- **When to disable**: Use `--no-outlier-handling` if:
+  - Historical spikes/drops are legitimate business variations (not data errors)
+  - Seasonal Naive forecasts seem too low/high compared to recent actuals
+  - You prefer raw historical values without statistical smoothing
+- **Impact on models**:
+  - **Seasonal Naive**: Directly affected - forecasts capped historical values instead of actual
+  - **ETS**: Less affected - has its own validation bounds
+- **Trade-off**: Disabling improves accuracy for sites with real volatility but reduces robustness against data errors
+
 ## Common Commands
 
 ### Setup and Data Loading
@@ -131,6 +143,10 @@ python cli.py forecast 2026-01 --by site --include-all
 
 # Lower minimum data requirement
 python cli.py forecast 2026-01 --by site --min-months 12
+
+# Disable outlier detection and capping (use raw historical values)
+# Useful when legitimate spikes/drops shouldn't be capped
+python cli.py forecast 2026-01 --by site_grade --no-outlier-handling
 ```
 
 ### Model Evaluation

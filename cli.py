@@ -23,32 +23,35 @@ def load_command(args):
 
     db = FuelDatabase(args.database, header_row=args.header_row)
 
-    if args.file:
-        # Single file
-        stats = db.load_from_excel(args.file)
-        print(f"\n✓ Loaded: {stats['file']}")
-        print(f"  • Inserted: {stats['inserted']:,} records")
-        print(f"  • Duplicates skipped: {stats['duplicates']:,}")
+    try:
+        if args.file:
+            # Single file
+            stats = db.load_from_excel(args.file)
+            print(f"\n✓ Loaded: {stats['file']}")
+            print(f"  • Inserted: {stats['inserted']:,} records")
+            print(f"  • Duplicates skipped: {stats['duplicates']:,}")
 
-    elif args.directory:
-        # All Excel files in directory
-        directory = Path(args.directory)
-        excel_files = list(directory.glob("*.xlsx")) + list(directory.glob("*.xls"))
+        elif args.directory:
+            # All Excel files in directory
+            directory = Path(args.directory)
+            excel_files = list(directory.glob("*.xlsx")) + list(directory.glob("*.xls"))
 
-        if not excel_files:
-            print(f"\n✗ No Excel files found in {directory}")
-            return
+            if not excel_files:
+                print(f"\n✗ No Excel files found in {directory}")
+                return
 
-        print(f"\nFound {len(excel_files)} Excel files\n")
-        results = db.load_multiple_files([str(f) for f in excel_files])
+            print(f"\nFound {len(excel_files)} Excel files\n")
+            results = db.load_multiple_files([str(f) for f in excel_files])
 
-        print("\nLoad Summary:")
-        print(results[["file", "inserted", "duplicates"]].to_string(index=False))
-        print(f"\nTotal inserted: {results['inserted'].sum():,}")
-        print(f"Total duplicates: {results['duplicates'].sum():,}")
+            print("\nLoad Summary:")
+            print(results[["file", "inserted", "duplicates"]].to_string(index=False))
+            print(f"\nTotal inserted: {results['inserted'].sum():,}")
+            print(f"Total duplicates: {results['duplicates'].sum():,}")
 
-    db.close()
-    print("\n✓ Complete!")
+        print("\n✓ Complete!")
+
+    finally:
+        db.close()
 
 
 def status_command(args):
@@ -59,45 +62,47 @@ def status_command(args):
 
     db = FuelDatabase(args.database)
 
-    # Summary stats
-    stats = db.get_summary_stats()
-    print("\nRecords:")
-    print(f"  • Total: {stats['total_records']:,}")
-    print(f"  • Non-estimated: {stats['non_estimated_records']:,}")
-    print(f"\nDate Range: {stats['date_range']}")
-    print(f"Unique Sites: {stats['unique_sites']}")
-    print(f"Fuel Grades: {', '.join(stats['fuel_grades'])}")
+    try:
+        # Summary stats
+        stats = db.get_summary_stats()
+        print("\nRecords:")
+        print(f"  • Total: {stats['total_records']:,}")
+        print(f"  • Non-estimated: {stats['non_estimated_records']:,}")
+        print(f"\nDate Range: {stats['date_range']}")
+        print(f"Unique Sites: {stats['unique_sites']}")
+        print(f"Fuel Grades: {', '.join(stats['fuel_grades'])}")
 
-    # Data quality check
-    if args.detailed:
-        print("\n" + "-" * 60)
-        print("DATA QUALITY BY SITE")
-        print("-" * 60)
-        quality = db.get_site_data_quality()
+        # Data quality check
+        if args.detailed:
+            print("\n" + "-" * 60)
+            print("DATA QUALITY BY SITE")
+            print("-" * 60)
+            quality = db.get_site_data_quality()
 
-        # Show sites with insufficient data
-        insufficient = quality[quality["months_of_data"] < 24]
-        if not insufficient.empty:
-            print(f"\nSites with <24 months: {len(insufficient)}")
+            # Show sites with insufficient data
+            insufficient = quality[quality["months_of_data"] < 24]
+            if not insufficient.empty:
+                print(f"\nSites with <24 months: {len(insufficient)}")
+                print(
+                    insufficient[["site_id", "site", "months_of_data"]]
+                    .head(10)
+                    .to_string(index=False)
+                )
+
+            # Show summary
+            print("\nData Quality Summary:")
             print(
-                insufficient[["site_id", "site", "months_of_data"]]
-                .head(10)
-                .to_string(index=False)
+                f"  • Sites with 24+ months: {len(quality[quality['months_of_data'] >= 24])}"
+            )
+            print(
+                f"  • Sites with 12-23 months: {len(quality[(quality['months_of_data'] >= 12) & (quality['months_of_data'] < 24)])}"
+            )
+            print(
+                f"  • Sites with <12 months: {len(quality[quality['months_of_data'] < 12])}"
             )
 
-        # Show summary
-        print("\nData Quality Summary:")
-        print(
-            f"  • Sites with 24+ months: {len(quality[quality['months_of_data'] >= 24])}"
-        )
-        print(
-            f"  • Sites with 12-23 months: {len(quality[(quality['months_of_data'] >= 12) & (quality['months_of_data'] < 24)])}"
-        )
-        print(
-            f"  • Sites with <12 months: {len(quality[quality['months_of_data'] < 12])}"
-        )
-
-    db.close()
+    finally:
+        db.close()
 
 
 def forecast_command(args):

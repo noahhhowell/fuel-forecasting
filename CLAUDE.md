@@ -30,7 +30,7 @@ The codebase is organized into 4 main Python modules with clear separation of co
    - Handles monthly data aggregation from daily sales
    - Progress tracking for bulk forecasts (reports every 20 sites or 50 site-grade combos)
    - Data sufficiency checks before forecasting
-   - Ensemble prediction = simple average of all successful models
+   - Ensemble prediction = robust median of all successful models (more stable than mean)
    - Multi-sheet Excel output: Forecasts, Skipped items, Summary
 
 4. **cli.py** - Command-line interface with argparse
@@ -234,7 +234,8 @@ available = get_available_models()  # Returns dict of available model classes
 - Uses `dateutil.relativedelta` for month arithmetic
 
 ### Ensemble Logic
-- Ensemble = arithmetic mean of all successful model predictions
+- Ensemble = robust median of all successful model predictions
+- Median is more robust to outlier models than arithmetic mean
 - If a model fails, it's excluded from ensemble (doesn't cause ensemble failure)
 - Ensemble added as separate row with model='ENSEMBLE'
 - **Recommended for production use** - more robust than individual models

@@ -50,6 +50,29 @@ class SeasonalNaiveModel(ForecastModel):
     def fit(self, data: pd.DataFrame):
         """Fit Seasonal Naive model (just stores training data)"""
         try:
+            # Validate input data structure
+            if data is None or not isinstance(data, pd.DataFrame):
+                raise ValueError("Input data must be a pandas DataFrame")
+
+            if data.empty:
+                raise ValueError("Input data is empty - need at least 1 month of data")
+
+            # Check required columns exist
+            required_cols = ["volume", "date"]
+            missing_cols = [col for col in required_cols if col not in data.columns]
+            if missing_cols:
+                raise ValueError(
+                    f"Missing required columns: {missing_cols}. "
+                    f"Data must have 'date' and 'volume' columns."
+                )
+
+            # Validate data contains valid values
+            if data["volume"].isna().all():
+                raise ValueError("All volume values are NaN - cannot train model")
+
+            if data["date"].isna().all():
+                raise ValueError("All date values are NaN - cannot train model")
+
             self.train_volumes = data["volume"].reset_index(drop=True).values
             self.last_date = data["date"].max()
             self.is_fitted = True
@@ -62,6 +85,13 @@ class SeasonalNaiveModel(ForecastModel):
         """Generate Seasonal Naive predictions"""
         if not self.is_fitted:
             raise ValueError("Model not fitted")
+
+        # Safety check: ensure we have training data
+        if len(self.train_volumes) == 0:
+            raise ValueError(
+                "No training data available - cannot generate predictions. "
+                "This should not happen if model was properly fitted."
+            )
 
         predictions = []
 
@@ -103,6 +133,29 @@ class ETSModel(ForecastModel):
     def fit(self, data: pd.DataFrame):
         """Fit ETS model with adaptive parameters"""
         try:
+            # Validate input data structure
+            if data is None or not isinstance(data, pd.DataFrame):
+                raise ValueError("Input data must be a pandas DataFrame")
+
+            if data.empty:
+                raise ValueError("Input data is empty - need at least 1 month of data")
+
+            # Check required columns exist
+            required_cols = ["volume", "date"]
+            missing_cols = [col for col in required_cols if col not in data.columns]
+            if missing_cols:
+                raise ValueError(
+                    f"Missing required columns: {missing_cols}. "
+                    f"Data must have 'date' and 'volume' columns."
+                )
+
+            # Validate data contains valid values
+            if data["volume"].isna().all():
+                raise ValueError("All volume values are NaN - cannot train model")
+
+            if data["date"].isna().all():
+                raise ValueError("All date values are NaN - cannot train model")
+
             y = data["volume"].astype(float).to_numpy()
             data_length = len(y)
 

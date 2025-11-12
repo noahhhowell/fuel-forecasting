@@ -34,7 +34,7 @@ The codebase is organized into 4 main Python modules with clear separation of co
    - Multi-sheet Excel output: Forecasts, Skipped items, Summary
 
 4. **cli.py** - Command-line interface with argparse
-   - Four main commands: load, status, forecast, backtest
+   - Five main commands: load, status, export, forecast, backtest
    - All user interactions flow through this entry point
    - Database path defaults to 'fuel_sales.db' in current directory
 
@@ -88,6 +88,27 @@ python cli.py load --directory ./data
 # Check database status
 python cli.py status
 python cli.py status --detailed  # Shows data quality per site
+```
+
+### Export to CSV
+```bash
+# Export all data to CSV
+python cli.py export --output fuel_data.csv
+
+# Export with date range filter
+python cli.py export --output 2024_data.csv --start-date 2024-01-01 --end-date 2024-12-31
+
+# Export specific site
+python cli.py export --output site_4551.csv --site-id 4551
+
+# Export specific fuel grade
+python cli.py export --output unleaded.csv --grade UNL
+
+# Export with multiple filters (combine any filters)
+python cli.py export --output filtered.csv --start-date 2023-01-01 --grade DSL --site-id 4551
+
+# Include estimated values (default is to exclude them)
+python cli.py export --output all_data.csv --include-estimated
 ```
 
 ### Forecasting

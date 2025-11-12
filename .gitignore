@@ -1,0 +1,162 @@
+# ===================================
+# SENSITIVE COMPANY DATA - DO NOT COMMIT
+# ===================================
+
+# Database files (contains all fuel sales data)
+*.db
+*.sqlite
+*.sqlite3
+fuel_sales.db
+
+# Excel files with company data
+*.xlsx
+*.xls
+*.xlsm
+*.xlsb
+
+# CSV files with company data
+*.csv
+
+# Data directories
+data/
+forecasts/
+
+# Any output or generated reports
+*_backtest.xlsx
+*_forecast.xlsx
+*_report.xlsx
+
+# ===================================
+# PYTHON
+# ===================================
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.virtualenv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# pyenv
+.python-version
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+pyright_report.json
+
+# ===================================
+# OPERATING SYSTEM
+# ===================================
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.Spotlight-V100
+.Trashes
+
+# Linux
+*~
+.directory
+
+# ===================================
+# IDEs and EDITORS
+# ===================================
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iml
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+\#*\#
+.\#*
+
+# ===================================
+# LOGS AND TEMPORARY FILES
+# ===================================
+
+*.log
+*.tmp
+*.temp
+*.bak
+*.backup
+*.orig
+
+# ===================================
+# ENVIRONMENT AND SECRETS
+# ===================================
+
+.env
+.env.local
+.env.*.local
+secrets.json
+credentials.json

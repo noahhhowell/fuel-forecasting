@@ -34,7 +34,7 @@ The codebase is organized into 4 main Python modules with clear separation of co
    - Multi-sheet Excel output: Forecasts, Skipped items, Summary
 
 4. **cli.py** - Command-line interface with argparse
-   - Four main commands: load, status, forecast, backtest
+   - Three main commands: load, status, forecast
    - All user interactions flow through this entry point
    - Database path defaults to 'fuel_sales.db' in current directory
 
@@ -114,20 +114,10 @@ python cli.py forecast 2026-01 --by site --min-months 12
 
 ### Model Evaluation
 ```bash
-# Backtest on last 6 months (all data combined)
-python cli.py backtest --months 6
+# Generate a trial forecast and review results in Excel
+python cli.py forecast 2026-01 --by site --output trial_forecast.xlsx
 
-# Backtest specific site
-python cli.py backtest --months 6 --site-id 4551
-
-# Backtest specific grade
-python cli.py backtest --months 6 --grade UNL
-
-# Backtest ALL SITES individually (generates comprehensive Excel report)
-python cli.py backtest --months 12 --all-sites --output all_sites_backtest.xlsx
-
-# Backtest all sites with specific model only
-python cli.py backtest --months 6 --all-sites --model ets --output ets_backtest.xlsx
+# After actuals arrive, compare them in Excel to estimate MAPE/MAE
 ```
 
 ### Testing

@@ -67,9 +67,10 @@ python cli.py status --detailed
 ## Model Evaluation
 
 ```bash
-# Test last 6 months
-python cli.py backtest --months 6
+# Generate a trial forecast and save to Excel
+python cli.py forecast 2026-01 --by site --output trial_forecast.xlsx
 
+# After actuals arrive, compare them against the forecast in Excel
 # Good: MAPE < 5%
 # Acceptable: MAPE 5-10%
 # Poor: MAPE > 10% (investigate data quality)
@@ -99,7 +100,6 @@ python cli.py forecast 2026-01
 ```bash
 python cli.py --help
 python cli.py forecast --help
-python cli.py backtest --help
 ```
 
 ## What Each Forecast Level Does
@@ -123,11 +123,11 @@ Progress tracker shows exactly where it is.
 
 1. ✅ Load data weekly
 2. ✅ Use ENSEMBLE for production
-3. ✅ Run backtest quarterly
-4. ✅ Check `status --detailed` regularly
-5. ✅ Require 24+ months of data
-6. ✅ Review "Skipped" sheet in output
-7. ✅ Keep forecasts for accuracy tracking
+3. ✅ Check `status --detailed` regularly
+4. ✅ Require 24+ months of data
+5. ✅ Review "Skipped" sheet in output
+6. ✅ Keep forecasts for accuracy tracking
+7. ✅ Spot-check forecasts against recent actuals
 
 ---
 

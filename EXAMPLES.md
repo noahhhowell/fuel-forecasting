@@ -13,9 +13,6 @@ python cli.py status --detailed
 
 # Generate simple test forecast
 python cli.py forecast 2026-01
-
-# Evaluate models
-python cli.py backtest --months 6
 ```
 
 ## Example 2: Monthly Forecast Process
@@ -119,31 +116,7 @@ python cli.py forecast 2026-01 --model prophet --output prophet.xlsx
 python cli.py forecast 2026-01 --model xgboost --output xgboost.xlsx
 ```
 
-## Example 10: Comprehensive Backtest
-
-```bash
-# Test on last 12 months
-python cli.py backtest --months 12 --output backtest_full.xlsx
-
-# Output shows:
-# Model                  MAE      RMSE     MAPE
-# Prophet              45,567   67,890   3.45%
-# XGBoost              46,234   68,123   3.51%
-# Exponential_Smoothing 48,567  71,234   3.68%
-# SARIMA               52,345   74,567   3.98%
-```
-
-## Example 11: Backtest Specific Site
-
-```bash
-# Test models for your highest-volume site
-python cli.py backtest --months 6 --site-id 4551 --output backtest_4551.xlsx
-
-# Or test a specific grade
-python cli.py backtest --months 6 --grade UNL --output backtest_UNL.xlsx
-```
-
-## Example 12: Weekly Data Updates
+## Example 10: Weekly Data Updates
 
 ```bash
 # Every week after PDI export
@@ -158,7 +131,7 @@ python cli.py status
 #   • Non-estimated: 428,456
 ```
 
-## Example 13: Data Quality Check
+## Example 11: Data Quality Check
 
 ```bash
 python cli.py status --detailed
@@ -172,7 +145,7 @@ python cli.py status --detailed
 # ...
 ```
 
-## Example 14: Multi-File Load
+## Example 12: Multi-File Load
 
 ```bash
 # Load all yearly exports at once
@@ -195,7 +168,7 @@ python cli.py load --directory ./data
 # Total duplicates: 234
 ```
 
-## Example 15: Production Workflow
+## Example 13: Production Workflow
 
 ```bash
 # Monthly production workflow script
@@ -213,23 +186,7 @@ python cli.py status --detailed > production/quality_report.txt
 # (manually compare actuals vs predictions)
 ```
 
-## Example 16: Model Selection Strategy
-
-```bash
-# Step 1: Run backtest on aggregate data
-python cli.py backtest --months 12
-
-# Step 2: Test on specific sites
-python cli.py backtest --months 6 --site-id 4551
-python cli.py backtest --months 6 --site-id 4552
-python cli.py backtest --months 6 --site-id 4553
-
-# Step 3: Based on results, use best model or ensemble
-# If MAPE < 5% consistently, models are good
-# If MAPE > 10%, investigate data quality
-```
-
-## Example 17: Handling New Sites
+## Example 14: Handling New Sites
 
 ```bash
 # New sites won't have enough data yet
@@ -250,7 +207,7 @@ python cli.py forecast 2026-01 --by site --include-all --output all_sites.xlsx
 # Their forecasts will be less reliable but might be better than nothing
 ```
 
-## Example 18: Custom Thresholds
+## Example 15: Custom Thresholds
 
 ```bash
 # Default requires 24 months, but you can adjust:
@@ -265,7 +222,7 @@ python cli.py forecast 2026-01 --by site --min-months 12 --output lenient.xlsx
 python cli.py forecast 2026-01 --by site --min-months 6 --output risky.xlsx
 ```
 
-## Example 19: Comparing Methods
+## Example 16: Comparing Methods
 
 ```bash
 # Generate forecasts with different methods to compare
@@ -281,7 +238,7 @@ python cli.py forecast 2026-01 --by site --output site_forecasts.xlsx
 # Compare the two approaches - should be similar!
 ```
 
-## Example 20: Recovery from Errors
+## Example 17: Recovery from Errors
 
 ```bash
 # If a forecast fails partway through:
@@ -300,7 +257,7 @@ python cli.py forecast 2026-01 --by site --min-months 12 --output retry.xlsx
 ## Tips from the Examples
 
 1. **Start simple**: Begin with aggregate forecasts before going detailed
-2. **Validate first**: Run backtests before using forecasts in production
+2. **Validate first**: Compare forecasts to recent actuals before using them in production
 3. **Use ensemble**: The ENSEMBLE model is usually most reliable
 4. **Check quality**: Use `--detailed` flag to spot data issues early
 5. **Update weekly**: More data = better forecasts

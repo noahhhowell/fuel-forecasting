@@ -34,7 +34,7 @@ The codebase is organized into 4 main Python modules with clear separation of co
    - Multi-sheet Excel output: Forecasts, Skipped items, Summary
 
 4. **cli.py** - Command-line interface with argparse
-   - Three main commands: load, status, forecast
+   - Four main commands: load, status, export, forecast
    - All user interactions flow through this entry point
    - Database path defaults to 'fuel_sales.db' in current directory
 
@@ -88,6 +88,23 @@ python cli.py load --directory ./data
 # Check database status
 python cli.py status
 python cli.py status --detailed  # Shows data quality per site
+```
+
+### Export to CSV
+```bash
+# Export all data
+python cli.py export --output fuel_data.csv
+
+# Export with filters
+python cli.py export --output 2024.csv --start-date 2024-01-01 --end-date 2024-12-31
+python cli.py export --output site_123.csv --site-id 123
+python cli.py export --output unl.csv --grade UNL
+
+# Include estimated values (excluded by default)
+python cli.py export --output all_data.csv --include-estimated
+
+# Combine multiple filters
+python cli.py export --output filtered.csv --site-id 123 --grade UNL --start-date 2024-01-01
 ```
 
 ### Forecasting
@@ -229,26 +246,6 @@ available = get_available_models()  # Returns dict of available model classes
 - If a model fails, it's excluded from ensemble (doesn't cause ensemble failure)
 - Ensemble added as separate row with model='ENSEMBLE'
 - **Recommended for production use** - more robust than individual models
-
-### Backtesting
-- Splits data into train/test
-- Trains on all months except last N
-- Predicts N months ahead iteratively
-- Calculates MAE, RMSE, MAPE, sMAPE metrics
-- Sorts results by MAPE (lower is better)
-- Returns tuple: (detailed_results_df, metrics_summary_df)
-
-**Bulk Site Backtesting** (`--all-sites`):
-- Backtests each site individually in parallel workflow
-- Generates comprehensive Excel report with 6+ sheets:
-  - **Overall_Metrics**: Average accuracy across all sites by model
-  - **Site_Metrics**: Per-site accuracy for every site (sortable)
-  - **Detailed_Results**: Month-by-month predictions vs actuals (sampled if >10k rows)
-  - **ETS_BestWorst**: Top 20 best + bottom 20 worst sites for ETS
-  - **snaive_BestWorst**: Top 20 best + bottom 20 worst sites for sNaive
-  - **Skipped**: Sites that failed or had insufficient data
-- Progress tracking: reports every 20 sites
-- Use for: portfolio-wide accuracy assessment, identifying problem sites, model selection
 
 ## Windows-Specific Notes
 

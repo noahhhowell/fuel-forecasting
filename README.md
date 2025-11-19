@@ -72,9 +72,6 @@ python cli.py load --file sales_latest.xlsx
 
 # 2. Generate forecast (monthly, 2 months ahead)
 python cli.py forecast 2026-03 --by site_grade --output mar_2026.xlsx
-
-# 3. Validate models (quarterly)
-python cli.py backtest --months 6
 ```
 
 ## 🔧 Common Commands
@@ -93,9 +90,6 @@ python cli.py forecast 2026-01
 
 # Forecast by site-grade (detailed)
 python cli.py forecast 2026-01 --by site_grade --output forecast.xlsx
-
-# Backtest models
-python cli.py backtest --months 6
 
 # Use specific model
 python cli.py forecast 2026-01 --model prophet
@@ -137,10 +131,9 @@ uv add prophet xgboost
 ## 💡 Tips
 
 1. Start simple: `python cli.py forecast 2026-01`
-2. Test models: `python cli.py backtest --months 12`
-3. Use ENSEMBLE for production forecasts
-4. Check data quality: `python cli.py status --detailed`
-5. Keep database updated weekly
+2. Use ENSEMBLE for production forecasts
+3. Check data quality: `python cli.py status --detailed`
+4. Keep database updated weekly
 
 ## 📋 Full Documentation
 

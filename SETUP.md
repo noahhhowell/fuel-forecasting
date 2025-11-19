@@ -118,8 +118,8 @@ Run PowerShell as Administrator
 
 1. Read [README.md](README.md) for full documentation
 2. Load all your historical data
-3. Run a backtest to evaluate models
-4. Generate your first production forecast
+3. Generate your first production forecast
+4. Review the output and data quality report
 
 ## Daily Usage
 

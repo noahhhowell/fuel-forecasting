@@ -173,104 +173,6 @@ def forecast_command(args):
         db.close()
 
 
-def backtest_command(args):
-    """Run backtesting"""
-    print("\n" + "=" * 60)
-    print("BACKTESTING MODELS")
-    print("=" * 60)
-
-    db = FuelDatabase(args.database)
-    forecaster = FuelForecaster(db)
-
-    try:
-        if args.all_sites:
-            # Backtest all sites individually
-            print(f"\nTest period: {args.months} months")
-            print("Mode: All sites (individual backtests)")
-            print("\nStarting backtests...")
-
-            results, site_metrics = forecaster.backtest_all_sites(
-                test_months=args.months,
-                models_to_use=[args.model] if args.model else None,
-                output_path=args.output,
-                skip_insufficient=not args.include_all,
-            )
-
-            # Show summary
-            print("\n" + "=" * 60)
-            print("TOP 10 MOST PREDICTABLE SITES (by MAPE)")
-            print("=" * 60)
-
-            for model_name in site_metrics["model"].unique():
-                model_data = site_metrics[site_metrics["model"] == model_name]
-                top10 = model_data.nsmallest(10, "MAPE")
-
-                print(f"\n{model_name.upper()}:")
-                for _, row in top10.iterrows():
-                    print(
-                        f"  {row['site_id']:8s} ({row['site_name']:30s}): MAPE={row['MAPE']:5.2f}%"
-                    )
-
-            if args.output:
-                print(f"\n✓ Detailed results saved to: {args.output}")
-                print(
-                    "  Excel sheets: Overall_Metrics, Site_Metrics, Detailed_Results, ETS_BestWorst, snaive_BestWorst"
-                )
-
-        else:
-            # Single backtest (original behavior)
-            print(f"\nTest period: {args.months} months")
-            if args.site_id:
-                print(f"Site: {args.site_id}")
-            if args.grade:
-                print(f"Grade: {args.grade}")
-
-            print("\nTraining models...")
-
-            results, metrics = forecaster.backtest(
-                test_months=args.months,
-                site_id=args.site_id,
-                grade=args.grade,
-                models_to_use=[args.model] if args.model else None,
-            )
-
-            print("\n" + "=" * 60)
-            print("RESULTS")
-            print("=" * 60)
-
-            # Format metrics table
-            metrics_display = metrics.copy()
-            metrics_display["MAE"] = metrics_display["MAE"].apply(lambda x: f"{x:,.0f}")
-            metrics_display["RMSE"] = metrics_display["RMSE"].apply(
-                lambda x: f"{x:,.0f}"
-            )
-            metrics_display["MAPE"] = metrics_display["MAPE"].apply(
-                lambda x: f"{x:.2f}%"
-            )
-
-            print("\n" + metrics_display.to_string(index=False))
-
-            # Best model
-            best = metrics.iloc[0]
-            print("\n" + "=" * 60)
-            print(f"BEST MODEL: {best['model']}")
-            print(f"  • MAPE: {best['MAPE']:.2f}%")
-            print(f"  • MAE: {best['MAE']:,.0f} gallons")
-            print(f"  • RMSE: {best['RMSE']:,.0f} gallons")
-            print("=" * 60)
-
-            if args.output:
-                results.to_excel(args.output, index=False)
-                print(f"\n✓ Detailed results saved to: {args.output}")
-
-    except Exception as e:
-        print(f"\n✗ Error: {e}")
-        sys.exit(1)
-
-    finally:
-        db.close()
-
-
 def main():
     """Main CLI entry point"""
     parser = argparse.ArgumentParser(
@@ -285,16 +187,12 @@ Examples:
   Check status:
     python cli.py status
     python cli.py status --detailed
-  
+
   Generate forecast:
     python cli.py forecast 2026-01                         # Forecasts by site (default)
     python cli.py forecast 2026-01 --output jan_2026.xlsx  # With Excel export
     python cli.py forecast 2026-01 --by total              # Total forecast only
     python cli.py forecast 2026-01 --by site_grade         # By site and grade
-  
-  Run backtest:
-    python cli.py backtest --months 6
-    python cli.py backtest --months 12 --output backtest.xlsx
         """,
     )
 
@@ -352,30 +250,6 @@ Examples:
     )
     forecast_parser.add_argument("--output", help="Output Excel file")
 
-    # Backtest command
-    backtest_parser = subparsers.add_parser("backtest", help="Backtest models")
-    backtest_parser.add_argument(
-        "--months", type=int, default=6, help="Test months (default: 6)"
-    )
-    backtest_parser.add_argument("--site-id", help="Specific site")
-    backtest_parser.add_argument("--grade", help="Specific grade")
-    backtest_parser.add_argument(
-        "--all-sites",
-        action="store_true",
-        help="Backtest all sites individually",
-    )
-    backtest_parser.add_argument(
-        "--include-all",
-        action="store_true",
-        help="Include sites with insufficient data (for --all-sites)",
-    )
-    backtest_parser.add_argument(
-        "--model",
-        choices=["ets", "snaive"],
-        help="Test specific model only",
-    )
-    backtest_parser.add_argument("--output", help="Output Excel file")
-
     args = parser.parse_args()
 
     if not args.command:
@@ -389,8 +263,6 @@ Examples:
             status_command(args)
         elif args.command == "forecast":
             forecast_command(args)
-        elif args.command == "backtest":
-            backtest_command(args)
     except KeyboardInterrupt:
         print("\n\nInterrupted by user")
         sys.exit(1)

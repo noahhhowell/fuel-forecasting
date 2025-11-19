@@ -22,7 +22,7 @@ The application is structured into four main modules:
 
 1.  `cli.py`: The main entry point and user interface. It handles command-line argument parsing and orchestrates the overall workflow.
 2.  `database.py`: A `FuelDatabase` class that manages all interactions with the SQLite database. This includes data loading, deduplication, and querying.
-3.  `forecaster.py`: A `FuelForecaster` class that contains the core forecasting logic. It prepares data, trains the models, generates predictions, and performs backtesting.
+3.  `forecaster.py`: A `FuelForecaster` class that contains the core forecasting logic. It prepares data, trains the models, and generates predictions.
 4.  `models.py`: Defines the forecasting models. It includes a base `ForecastModel` class and implementations for Exponential Smoothing (ETS) and a Seasonal Naive model.
 
 ## Building and Running
@@ -70,12 +70,6 @@ The application is run via `cli.py`. Here are the main commands:
 
     # Forecast by site and grade (most detailed)
     python cli.py forecast YYYY-MM --by site_grade --output forecast.xlsx
-    ```
-
-*   **Backtest Models:** Evaluate model accuracy using historical data.
-
-    ```bash
-    python cli.py backtest --months 6
     ```
 
 ## Development Conventions

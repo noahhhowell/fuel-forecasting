@@ -167,43 +167,35 @@ class FuelDatabase:
 
     def _build_column_mapping(self, columns) -> dict:
         """Build flexible column name mapping"""
+        # Pattern rules: (check_function, target_column_name)
+        # Order matters - more specific patterns first
+        patterns = [
+            (lambda c: "site" in c and "id" in c, "site_id"),
+            (lambda c: "b" in c and "unit" in c, "b_unit"),
+            (lambda c: "estimated" in c, "is_estimated"),
+            (lambda c: "total" in c and "sales" in c, "total_sales"),
+            (lambda c: c == "site", "site"),  # Exact match after site_id check
+            (lambda c: c == "grade", "grade"),
+            (lambda c: c == "day", "day"),
+            (lambda c: c == "brand", "brand"),
+            (lambda c: c == "address", "address"),
+            (lambda c: c == "city", "city"),
+            (lambda c: c == "state", "state"),
+            (lambda c: c == "owner", "owner"),
+            (lambda c: c == "stock", "stock"),
+            (lambda c: c == "delivered", "delivered"),
+            (lambda c: c == "volume", "volume"),
+            (lambda c: c == "target", "target"),
+        ]
+
         mapping = {}
         for col in columns:
             col_lower = col.lower().replace(" ", "_").replace("/", "_")
-            
-            if "site" in col_lower and "id" in col_lower:
-                mapping[col] = "site_id"
-            elif col_lower == "grade":
-                mapping[col] = "grade"
-            elif col_lower == "day":
-                mapping[col] = "day"
-            elif col_lower == "brand":
-                mapping[col] = "brand"
-            elif col_lower == "site" and "id" not in col_lower:
-                mapping[col] = "site"
-            elif col_lower == "address":
-                mapping[col] = "address"
-            elif col_lower == "city":
-                mapping[col] = "city"
-            elif col_lower == "state":
-                mapping[col] = "state"
-            elif col_lower == "owner":
-                mapping[col] = "owner"
-            elif "b" in col_lower and "unit" in col_lower:
-                mapping[col] = "b_unit"
-            elif col_lower == "stock":
-                mapping[col] = "stock"
-            elif col_lower == "delivered":
-                mapping[col] = "delivered"
-            elif col_lower == "volume":
-                mapping[col] = "volume"
-            elif "estimated" in col_lower:
-                mapping[col] = "is_estimated"
-            elif "total" in col_lower and "sales" in col_lower:
-                mapping[col] = "total_sales"
-            elif col_lower == "target":
-                mapping[col] = "target"
-        
+            for check, target in patterns:
+                if check(col_lower):
+                    mapping[col] = target
+                    break
+
         return mapping
 
     def _get_count(self) -> int:

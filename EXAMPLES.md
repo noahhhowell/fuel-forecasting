@@ -36,13 +36,10 @@ python cli.py forecast 2026-04 --by site_grade --output forecasts/apr_2026.xlsx
 python cli.py forecast 2026-01
 
 # Output will show:
-# SARIMA:                  1,234,567.89 gallons
-# Exponential_Smoothing:   1,245,123.45 gallons
-# Prophet:                 1,238,901.23 gallons
-# XGBoost:                 1,241,234.56 gallons
-# LightGBM:                1,240,123.45 gallons
+# ETS:                     1,234,567.89 gallons
+# SeasonalNaive:           1,238,901.23 gallons
 # ──────────────────────────────────────────────
-# RECOMMENDED (Ensemble):  1,239,990.12 gallons  ← Use this
+# RECOMMENDED (Ensemble):  1,236,734.56 gallons  ← Use this (median)
 ```
 
 ## Example 4: Forecast by Fuel Grade
@@ -52,13 +49,14 @@ python cli.py forecast 2026-01
 python cli.py forecast 2026-01 --by grade --output grades_jan_2026.xlsx
 
 # Excel will have:
-# Grade | Model    | Forecast
-# UNL   | SARIMA   | 800,000
-# UNL   | Prophet  | 805,000
-# UNL   | ...      | ...
-# UNL   | ENSEMBLE | 802,500  ← Use this for UNL
-# PRE   | SARIMA   | 300,000
-# PRE   | ...      | ...
+# Grade | Model         | Forecast
+# UNL   | ETS           | 800,000
+# UNL   | SeasonalNaive | 805,000
+# UNL   | ENSEMBLE      | 802,500  ← Use this for UNL
+# PRE   | ETS           | 300,000
+# PRE   | SeasonalNaive | 302,000
+# PRE   | ENSEMBLE      | 301,000  ← Use this for PRE
+# ... (3 rows per grade)
 ```
 
 ## Example 5: Individual Site Forecasts
@@ -82,7 +80,7 @@ python cli.py forecast 2026-01 --by site_grade --output detailed_jan_2026.xlsx
 
 # With 400 sites × 3 grades = 1,200 combinations
 # Takes ~15-30 minutes
-# Excel will have 1,200 × 6 = 7,200 rows (6 per combination)
+# Excel will have 1,200 × 3 = 3,600 rows (3 per combination: ETS, SeasonalNaive, ENSEMBLE)
 ```
 
 ## Example 7: Only High-Quality Sites
@@ -107,13 +105,17 @@ python cli.py forecast 2026-01 --by site --min-months 12 --output sites_12mo.xls
 ## Example 9: Use Specific Model Only
 
 ```bash
-# Only use Prophet model
-python cli.py forecast 2026-01 --model prophet --output prophet_only.xlsx
+# Only use ETS model
+python cli.py forecast 2026-01 --model ets --output ets_only.xlsx
 
-# Test each model individually
-python cli.py forecast 2026-01 --model sarima --output sarima.xlsx
-python cli.py forecast 2026-01 --model prophet --output prophet.xlsx
-python cli.py forecast 2026-01 --model xgboost --output xgboost.xlsx
+# Only use Seasonal Naive model
+python cli.py forecast 2026-01 --model snaive --output snaive_only.xlsx
+
+# Compare both models individually
+python cli.py forecast 2026-01 --by site --model ets --output sites_ets.xlsx
+python cli.py forecast 2026-01 --by site --model snaive --output sites_snaive.xlsx
+# Then compare against ensemble forecast
+python cli.py forecast 2026-01 --by site --output sites_ensemble.xlsx
 ```
 
 ## Example 10: Weekly Data Updates
@@ -131,7 +133,30 @@ python cli.py status
 #   • Non-estimated: 428,456
 ```
 
-## Example 11: Data Quality Check
+## Example 11: Export Data to CSV
+
+```bash
+# Export all data
+python cli.py export --output fuel_data.csv
+
+# Export specific date range
+python cli.py export --output 2024_data.csv --start-date 2024-01-01 --end-date 2024-12-31
+
+# Export specific site
+python cli.py export --output site_4551.csv --site-id 4551
+
+# Export specific grade
+python cli.py export --output unl_only.csv --grade UNL
+
+# Combine filters
+python cli.py export --output site_4551_unl_2024.csv \
+  --site-id 4551 --grade UNL --start-date 2024-01-01 --end-date 2024-12-31
+
+# Include estimated values (excluded by default)
+python cli.py export --output with_estimated.csv --include-estimated
+```
+
+## Example 12: Data Quality Check
 
 ```bash
 python cli.py status --detailed
@@ -145,7 +170,7 @@ python cli.py status --detailed
 # ...
 ```
 
-## Example 12: Multi-File Load
+## Example 13: Multi-File Load
 
 ```bash
 # Load all yearly exports at once
@@ -168,7 +193,7 @@ python cli.py load --directory ./data
 # Total duplicates: 234
 ```
 
-## Example 13: Production Workflow
+## Example 14: Production Workflow
 
 ```bash
 # Monthly production workflow script
@@ -186,7 +211,7 @@ python cli.py status --detailed > production/quality_report.txt
 # (manually compare actuals vs predictions)
 ```
 
-## Example 14: Handling New Sites
+## Example 15: Handling New Sites
 
 ```bash
 # New sites won't have enough data yet
@@ -207,7 +232,7 @@ python cli.py forecast 2026-01 --by site --include-all --output all_sites.xlsx
 # Their forecasts will be less reliable but might be better than nothing
 ```
 
-## Example 15: Custom Thresholds
+## Example 16: Custom Thresholds
 
 ```bash
 # Default requires 24 months, but you can adjust:
@@ -222,7 +247,7 @@ python cli.py forecast 2026-01 --by site --min-months 12 --output lenient.xlsx
 python cli.py forecast 2026-01 --by site --min-months 6 --output risky.xlsx
 ```
 
-## Example 16: Comparing Methods
+## Example 17: Comparing Methods
 
 ```bash
 # Generate forecasts with different methods to compare
@@ -238,7 +263,7 @@ python cli.py forecast 2026-01 --by site --output site_forecasts.xlsx
 # Compare the two approaches - should be similar!
 ```
 
-## Example 17: Recovery from Errors
+## Example 18: Recovery from Errors
 
 ```bash
 # If a forecast fails partway through:
@@ -258,14 +283,16 @@ python cli.py forecast 2026-01 --by site --min-months 12 --output retry.xlsx
 
 1. **Start simple**: Begin with aggregate forecasts before going detailed
 2. **Validate first**: Compare forecasts to recent actuals before using them in production
-3. **Use ensemble**: The ENSEMBLE model is usually most reliable
+3. **Use ensemble**: The ENSEMBLE median is more robust than individual models
 4. **Check quality**: Use `--detailed` flag to spot data issues early
 5. **Update weekly**: More data = better forecasts
 6. **Archive results**: Keep old forecasts to track accuracy over time
-7. **Watch MAPE**: If > 5%, investigate; if > 10%, don't trust the forecast
-8. **New sites**: Exclude until they have 24+ months
+7. **Monitor actuals**: After month-end, compare forecasts to actuals in Excel to gauge accuracy
+8. **New sites**: Exclude until they have 24+ months of data
 9. **Progress tracking**: For bulk forecasts, the progress counter is your friend
 10. **Excel sheets**: Use the "Skipped" sheet to understand what didn't work
+11. **Outlier handling**: Check logs for outlier capping - may indicate data quality issues
+12. **Model differences**: ETS adapts to trends, Seasonal Naive is simpler but often competitive
 
 ## Python API Examples
 

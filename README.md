@@ -1,16 +1,18 @@
-# Fuel Forecasting System v2.0
+# Fuel Forecasting System
 
-Clean, professional forecasting system for gas station fuel volume with 4 state-of-the-art models.
+Clean, professional forecasting system for gas station fuel volume predictions using fast, stable models.
 
 ## ✨ Features
 
-- **4 Forecasting Models**: SARIMA, Exponential Smoothing, Prophet, XGBoost
-- **Automatic Ensemble**: Combines all models for robust predictions
+- **2 Forecasting Models**: ETS (Holt-Winters) and Seasonal Naive
+- **Automatic Ensemble**: Combines models using robust median for stable predictions
 - **Smart Deduplication**: Never worry about loading duplicate data
 - **Progress Tracking**: See exactly what's happening during bulk forecasts
 - **Data Quality Checks**: Skip sites with insufficient data automatically
+- **Outlier Handling**: Automatic detection and capping using MAD method
 - **Flexible Output**: Forecast by total, grade, site, or site-grade combinations
-- **Professional Excel Exports**: Multi-sheet workbooks with summaries
+- **Professional Excel Exports**: Multi-sheet workbooks with summaries and skipped items
+- **CSV Export**: Export filtered data with flexible date/site/grade filters
 
 ## 🚀 Quick Start
 
@@ -23,7 +25,7 @@ uv sync
 
 Or using pip:
 ```bash
-pip install pandas numpy openpyxl statsmodels prophet xgboost python-dateutil
+pip install pandas numpy openpyxl statsmodels python-dateutil
 ```
 
 ### 2. Load Your Data
@@ -59,10 +61,10 @@ python cli.py forecast 2026-01 --by site_grade --output jan_2026_detailed.xlsx
 
 | Level | What It Does | Use Case | Output Rows |
 |-------|-------------|----------|-------------|
-| `total` | One forecast for all sites/grades | Company-wide planning | 5 (4 models + ensemble) |
-| `grade` | One forecast per fuel type | Grade-level planning | 5 × # grades |
-| `site` | One forecast per site (all grades combined) | Site-level planning | 5 × # sites |
-| `site_grade` | One forecast per site-grade combo | Detailed planning | 5 × # combinations |
+| `total` | One forecast for all sites/grades | Company-wide planning | 3 (2 models + ensemble) |
+| `grade` | One forecast per fuel type | Grade-level planning | 3 × # grades |
+| `site` | One forecast per site (all grades combined) | Site-level planning | 3 × # sites |
+| `site_grade` | One forecast per site-grade combo | Detailed planning | 3 × # combinations |
 
 ## 🎯 Monthly Workflow
 
@@ -92,7 +94,12 @@ python cli.py forecast 2026-01
 python cli.py forecast 2026-01 --by site_grade --output forecast.xlsx
 
 # Use specific model
-python cli.py forecast 2026-01 --model prophet
+python cli.py forecast 2026-01 --model ets --output ets_only.xlsx
+python cli.py forecast 2026-01 --model snaive --output snaive_only.xlsx
+
+# Export data to CSV
+python cli.py export --output fuel_data.csv
+python cli.py export --output 2024.csv --start-date 2024-01-01 --end-date 2024-12-31
 ```
 
 ## 📈 Understanding Output
@@ -100,10 +107,10 @@ python cli.py forecast 2026-01 --model prophet
 Forecast Excel file has 3 sheets:
 
 1. **Forecasts**: All models + ENSEMBLE (recommended)
-2. **Skipped**: Sites with insufficient data
-3. **Summary**: Aggregated statistics
+2. **Skipped**: Sites with insufficient data and reasons
+3. **Summary**: Aggregated statistics by model
 
-Use **ENSEMBLE** for production - it averages all models.
+Use **ENSEMBLE** for production - it uses the robust median of all models, providing more stable predictions than individual models.
 
 ## 🐛 Troubleshooting
 
@@ -119,21 +126,20 @@ python cli.py forecast 2026-01 --by site --include-all
 python cli.py status --detailed
 ```
 
-**Model not available?**
-```bash
-uv add prophet xgboost
-```
-
 **Slow with 400 sites?**
-- Normal! Site-grade forecasts take 15-30 minutes
-- Progress tracker shows exactly where it is
+- Normal! Site-grade forecasts take 15-30 minutes for 400 sites × 3 grades
+- Progress tracker shows exactly where it is (updates every 20 sites or 50 combinations)
+- The ETS model is fast but still needs time for 1,200+ fits
 
 ## 💡 Tips
 
-1. Start simple: `python cli.py forecast 2026-01`
-2. Use ENSEMBLE for production forecasts
-3. Check data quality: `python cli.py status --detailed`
-4. Keep database updated weekly
+1. **Start simple**: Begin with aggregate forecasts (`python cli.py forecast 2026-01`)
+2. **Use ENSEMBLE**: The ensemble median is more robust than individual models
+3. **Check data quality**: Run `python cli.py status --detailed` before bulk forecasts
+4. **Update weekly**: Load new data weekly for better forecast accuracy
+5. **24-month minimum**: Sites with less than 24 months of data produce unreliable forecasts
+6. **Monitor outliers**: The system auto-caps outliers using MAD method - check logs for details
+7. **Export for analysis**: Use `python cli.py export` to analyze historical data in Excel/Python
 
 ## 📋 Full Documentation
 

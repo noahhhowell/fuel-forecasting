@@ -76,6 +76,15 @@ class SeasonalNaiveModel(ForecastModel):
         try:
             self._validate_input(data)
 
+            # Ensure strictly monthly frequency to prevent seasonal shifts
+            data['date'] = pd.to_datetime(data['date'])
+            full_range = pd.date_range(start=data['date'].min(), end=data['date'].max(), freq='MS')
+
+            # Reindex and forward fill to handle missing months (prevents "12 months ago" being wrong)
+            data = data.set_index('date').reindex(full_range).ffill().reset_index()
+            if 'index' in data.columns:
+                data = data.rename(columns={'index': 'date'})
+
             self.train_volumes = data["volume"].reset_index(drop=True).values
             self.last_date = data["date"].max()
             self.is_fitted = True
@@ -186,31 +195,18 @@ class ETSModel(ForecastModel):
             raise
 
     def predict(self, periods: int) -> pd.DataFrame:
-        """Generate ETS predictions with validation bounds"""
+        """Generate ETS predictions"""
         if not self.is_fitted:
             raise ValueError("Model not fitted")
 
         forecast = self.model.forecast(steps=periods)
-
-        # Validation bounds: mean ± 3*std, with absolute pad for near-constant series
-        upper_bound = self.training_mean + (3 * self.training_std)
-        lower_bound = max(0.0, self.training_mean - (3 * self.training_std))
-
-        # Secondary pad in case bounds collapse
-        pad = max(10.0, abs(self.training_mean) * 0.5)
-        if upper_bound <= lower_bound:
-            upper_bound = self.training_mean + pad
-            lower_bound = max(0.0, self.training_mean - pad)
-
-        # Clip to bounds
-        forecast = np.clip(forecast, lower_bound, upper_bound)
 
         # Generate future dates
         future_dates = [
             self.last_date + relativedelta(months=i + 1) for i in range(periods)
         ]
 
-        # Ensure non-negative
+        # Ensure non-negative (volumes cannot be negative)
         forecast_values = np.maximum(0.0, forecast)
 
         return pd.DataFrame(

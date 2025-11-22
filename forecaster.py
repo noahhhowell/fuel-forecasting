@@ -110,9 +110,10 @@ class FuelForecaster:
             upper_bound = median * 1.3
         else:
             # Define outlier boundaries with zero floor (volume cannot be negative)
-            # Using 3.0 * MAD as threshold (equivalent to ~3 sigma for normal distributions)
+            # Using 3.0 * MAD for lower bound to catch data errors
+            # Using 5.0 * median for upper bound to allow valid high demand (holidays, etc.)
             lower_bound = max(0.0, median - 3.0 * MAD)
-            upper_bound = median + 3.0 * MAD
+            upper_bound = median * 5.0  # Allow valid high demand, only clip data errors
 
         # Identify outliers
         outlier_mask = (volumes < lower_bound) | (volumes > upper_bound)

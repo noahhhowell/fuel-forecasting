@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 from typing import Optional, List, Dict, Tuple, Any
 import logging
+from pathlib import Path
 
 # Handle both relative and absolute imports
 try:
@@ -473,10 +474,20 @@ class FuelForecaster:
 
         # Export to Excel
         if output_path:
-            self._export_to_excel(combined, skipped, output_path)
-            logger.info(f"  → Saved to: {output_path}")
+            self._export_results(combined, skipped, output_path)
 
         return combined
+
+    def _export_results(
+        self, forecasts: pd.DataFrame, skipped: List[Dict], output_path: str
+    ):
+        """Export forecasts to Excel or CSV based on output extension"""
+        suffix = Path(output_path).suffix.lower()
+        if suffix == ".csv":
+            self._export_to_csv(forecasts, skipped, output_path)
+        else:
+            self._export_to_excel(forecasts, skipped, output_path)
+        logger.info(f"  → Saved to: {output_path}")
 
     def _export_to_excel(
         self, forecasts: pd.DataFrame, skipped: List[Dict], output_path: str
@@ -484,7 +495,24 @@ class FuelForecaster:
         """Export forecasts to Excel with multiple sheets"""
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             # Main forecasts
-            forecasts.to_excel(writer, sheet_name="Forecasts", index=False)
+            desired_order = [
+                "site_id",
+                "grade",
+                "target_month",
+                "model",
+                "forecast_volume",
+            ]
+            ordered_cols = [c for c in desired_order if c in forecasts.columns]
+
+            # Keep any extra columns (e.g., site_name) after the requested order
+            remaining_cols = [
+                c for c in forecasts.columns if c not in ordered_cols
+            ]
+            export_cols = ordered_cols + remaining_cols
+
+            forecasts[export_cols].to_excel(
+                writer, sheet_name="Forecasts", index=False
+            )
 
             # Skipped items (if any)
             if skipped:
@@ -500,3 +528,37 @@ class FuelForecaster:
             summary.columns = ["Model", "Count", "Total", "Average", "Min", "Max"]
             summary.to_excel(writer, sheet_name="Summary", index=False)
 
+    def _export_to_csv(
+        self, forecasts: pd.DataFrame, skipped: List[Dict], output_path: str
+    ):
+        """Export forecasts to CSV; skipped/summary go to sibling files"""
+        desired_order = [
+            "site_id",
+            "grade",
+            "target_month",
+            "model",
+            "forecast_volume",
+        ]
+        ordered_cols = [c for c in desired_order if c in forecasts.columns]
+        remaining_cols = [c for c in forecasts.columns if c not in ordered_cols]
+        export_cols = ordered_cols + remaining_cols
+
+        forecasts[export_cols].to_csv(output_path, index=False)
+
+        base = Path(output_path)
+
+        if skipped:
+            skipped_df = pd.DataFrame(skipped)
+            skipped_path = base.with_name(f"{base.stem}_skipped.csv")
+            skipped_df.to_csv(skipped_path, index=False)
+            logger.info(f"  → Skipped items saved to: {skipped_path}")
+
+        summary = (
+            forecasts.groupby("model")["forecast_volume"]
+            .agg(["count", "sum", "mean", "min", "max"])
+            .reset_index()
+        )
+        summary.columns = ["Model", "Count", "Total", "Average", "Min", "Max"]
+        summary_path = base.with_name(f"{base.stem}_summary.csv")
+        summary.to_csv(summary_path, index=False)
+        logger.info(f"  → Summary saved to: {summary_path}")

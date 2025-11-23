@@ -82,45 +82,37 @@ class FuelDatabase:
         logger.info(f"Database initialized: {self.db_path}")
 
     def load_from_excel(self, file_path: str) -> dict:
-        """
-        Load data from Excel file with automatic deduplication
-        
-        Args:
-            file_path: Path to Excel file
-            
-        Returns:
-            Dictionary with load statistics
-        """
+        """Load data from Excel file with automatic deduplication"""
         logger.info(f"Loading: {file_path}")
-        
-        # Read Excel file
         df = pd.read_excel(file_path, skiprows=self.header_row)
         logger.info(f"  Read {len(df):,} rows from Excel")
-        
-        # Normalize and map column names
+        return self._load_dataframe(df, file_path)
+
+    def load_from_csv(self, file_path: str) -> dict:
+        """Load data from CSV file with automatic deduplication"""
+        logger.info(f"Loading: {file_path}")
+        df = pd.read_csv(file_path)
+        logger.info(f"  Read {len(df):,} rows from CSV")
+        return self._load_dataframe(df, file_path)
+
+    def _load_dataframe(self, df: pd.DataFrame, file_path: str) -> dict:
+        """Normalize columns, validate, and insert rows with deduplication"""
         df.columns = df.columns.str.strip()
         column_map = self._build_column_mapping(df.columns)
         df = df.rename(columns=column_map)
-        
-        # Validate required columns
+
         required = ["site_id", "grade", "day", "volume"]
         missing = [col for col in required if col not in df.columns]
         if missing:
             raise ValueError(f"Missing columns: {missing}")
-        
-        # Convert date format
+
         df["day"] = pd.to_datetime(df["day"]).dt.strftime("%Y-%m-%d")
-        
-        # Handle is_estimated column
+
         if "is_estimated" in df.columns:
-            df["is_estimated"] = df["is_estimated"].map({
-                "TRUE": True, "FALSE": False, True: True, False: False,
-                "true": True, "false": False
-            }).fillna(False)
+            df["is_estimated"] = df["is_estimated"].apply(self._normalize_bool)
         else:
             df["is_estimated"] = False
-        
-        # Ensure all database columns exist
+
         db_cols = [
             "site_id", "grade", "day", "brand", "site", "address", 
             "city", "state", "owner", "b_unit", "stock", "delivered",
@@ -129,11 +121,10 @@ class FuelDatabase:
         for col in db_cols:
             if col not in df.columns:
                 df[col] = None
-        
-        # Insert with deduplication
+
         count_before = self._get_count()
         records = df[db_cols].itertuples(index=False, name=None)
-        
+
         sql = """
             INSERT OR IGNORE INTO sales (
                 site_id, grade, day, brand, site, address, city, state,
@@ -141,23 +132,22 @@ class FuelDatabase:
                 total_sales, target
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
-        
+
         with self.conn:
             self.conn.executemany(sql, records)
-        
+
         count_after = self._get_count()
         inserted = count_after - count_before
         duplicates = len(df) - inserted
-        
-        # Log metadata
+
         self.conn.execute(
             "INSERT INTO load_metadata (file_name, rows_loaded, rows_duplicates) VALUES (?, ?, ?)",
             (Path(file_path).name, inserted, duplicates)
         )
         self.conn.commit()
-        
+
         logger.info(f"  Inserted: {inserted:,} | Duplicates skipped: {duplicates:,}")
-        
+
         return {
             "file": Path(file_path).name,
             "total_rows": len(df),
@@ -198,16 +188,31 @@ class FuelDatabase:
 
         return mapping
 
+    def _normalize_bool(self, value) -> bool:
+        """Convert common truthy/falsey representations to bool"""
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        return text in {"true", "1", "yes", "y"}
+
     def _get_count(self) -> int:
         """Get total record count"""
         return self.conn.execute("SELECT COUNT(*) FROM sales").fetchone()[0]
 
     def load_multiple_files(self, file_paths: List[str]) -> pd.DataFrame:
-        """Load multiple Excel files"""
+        """Load multiple files (Excel or CSV)"""
         results = []
         for file_path in file_paths:
+            loader = self.load_from_excel
+            suffix = Path(file_path).suffix.lower()
+            if suffix == ".csv":
+                loader = self.load_from_csv
             try:
-                stats = self.load_from_excel(file_path)
+                stats = loader(file_path)
                 results.append(stats)
             except Exception as e:
                 logger.error(f"Failed to load {file_path}: {e}")

@@ -26,7 +26,11 @@ def load_command(args):
     try:
         if args.file:
             # Single file
-            stats = db.load_from_excel(args.file)
+            suffix = Path(args.file).suffix.lower()
+            if suffix == ".csv":
+                stats = db.load_from_csv(args.file)
+            else:
+                stats = db.load_from_excel(args.file)
             print(f"\n✓ Loaded: {stats['file']}")
             print(f"  • Inserted: {stats['inserted']:,} records")
             print(f"  • Duplicates skipped: {stats['duplicates']:,}")
@@ -34,13 +38,17 @@ def load_command(args):
         elif args.directory:
             # All Excel files in directory
             directory = Path(args.directory)
-            excel_files = list(directory.glob("*.xlsx")) + list(directory.glob("*.xls"))
+            excel_files = (
+                list(directory.glob("*.xlsx"))
+                + list(directory.glob("*.xls"))
+                + list(directory.glob("*.csv"))
+            )
 
             if not excel_files:
-                print(f"\n✗ No Excel files found in {directory}")
+                print(f"\n✗ No Excel/CSV files found in {directory}")
                 return
 
-            print(f"\nFound {len(excel_files)} Excel files\n")
+            print(f"\nFound {len(excel_files)} Excel/CSV files\n")
             results = db.load_multiple_files([str(f) for f in excel_files])
 
             print("\nLoad Summary:")

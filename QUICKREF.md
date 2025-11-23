@@ -13,8 +13,9 @@ mkdir data forecasts
 ## Daily Commands
 
 ```bash
-# Load new data
+# Load new data (Excel or CSV)
 python cli.py load --file data/latest.xlsx
+python cli.py load --file data/latest.csv
 
 # Check status
 python cli.py status
@@ -34,22 +35,29 @@ python cli.py forecast 2026-01 --by site --output jan_sites.xlsx
 
 # By site-grade (1200 combinations)
 python cli.py forecast 2026-01 --by site_grade --output jan_detailed.xlsx
+
+# Export forecasts to CSV
+python cli.py forecast 2026-01 --by site --output jan_sites.csv
 ```
 
 ## Models
 
-- **SARIMA**: Statistical, seasonal patterns
-- **Exponential Smoothing**: Fast, smooth trends
-- **Prophet**: Robust to missing data
-- **XGBoost**: High accuracy, non-linear
-- **ENSEMBLE**: ⭐ Recommended (averages all)
+- **ETS** (Holt-Winters)
+- **Seasonal Naive**
+- **ENSEMBLE**: ⭐ Recommended (median of available models)
 
 ## Output Format
 
-Excel with 3 sheets:
+Excel: 3 sheets
 1. **Forecasts**: All models + ENSEMBLE
 2. **Skipped**: Insufficient data
 3. **Summary**: Statistics by model
+Columns: `site_id, grade, target_month, model, forecast_volume` (+ extras after)
+
+CSV:
+- Main forecasts to the file you specify
+- Skipped to `<name>_skipped.csv`
+- Summary to `<name>_summary.csv`
 
 ## Troubleshooting
 
@@ -79,8 +87,8 @@ python cli.py forecast 2026-01 --by site --output trial_forecast.xlsx
 ## File Locations
 
 - **Database**: `fuel_sales.db` (auto-created)
-- **Excel data**: Put in `data/` folder
-- **Forecasts**: Saved to `forecasts/` folder
+- **Input data**: Put in `data/` folder (xlsx/csv)
+- **Forecasts**: Saved to `forecasts/` folder (xlsx/csv)
 
 ## Using with uv
 
@@ -106,10 +114,10 @@ python cli.py forecast --help
 
 | Level | Example | Output Rows |
 |-------|---------|-------------|
-| `total` | All sites/grades combined | 5 |
-| `grade` | UNL, PRE, DSL | 15 |
-| `site` | Each site (all grades) | 2,000 |
-| `site_grade` | Each site-grade combo | 6,000 |
+| `total` | All sites/grades combined | 3 |
+| `grade` | UNL, PRE, DSL | 3 × #grades |
+| `site` | Each site (all grades) | 3 × #sites |
+| `site_grade` | Each site-grade combo | 3 × #combos |
 
 ## Expected Runtimes
 

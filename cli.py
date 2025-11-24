@@ -192,6 +192,8 @@ def forecast_command(args):
             models_to_use=[args.model] if args.model else None,
             output_path=args.output,
             skip_insufficient=not args.include_all,
+            history_end_month=args.train_through,
+            include_actuals=args.compare_actuals,
         )
 
         # Display summary
@@ -231,6 +233,22 @@ def forecast_command(args):
                     f"RECOMMENDED (Ensemble): {ensemble['forecast_volume'].iloc[0]:,.2f} gallons"
                 )
                 print("-" * 60)
+
+        if args.compare_actuals:
+            summary = forecast.attrs.get("actuals_summary", {})
+            if summary:
+                print("\nACTUALS CHECK")
+                for model, stats in summary.items():
+                    mae = stats.get("mae")
+                    mape = stats.get("mape")
+                    count = stats.get("count", 0)
+                    mae_str = f"{mae:,.0f}" if mae is not None else "n/a"
+                    mape_str = f"{mape * 100:.2f}%" if mape is not None else "n/a"
+                    print(
+                        f"  {model:12s} MAE: {mae_str:>10s} | MAPE: {mape_str:>8s} | n={count}"
+                    )
+            else:
+                print("\nNo actuals available for that target month to compare.")
 
         if args.output:
             print(f"\n✓ Exported to: {args.output}")
@@ -343,6 +361,15 @@ Examples:
         type=int,
         default=24,
         help="Minimum months of data required (default: 24)",
+    )
+    forecast_parser.add_argument(
+        "--train-through",
+        help="Use history only through this month (YYYY-MM) for backtesting",
+    )
+    forecast_parser.add_argument(
+        "--compare-actuals",
+        action="store_true",
+        help="Attach actuals/error columns for the target month when available",
     )
     forecast_parser.add_argument(
         "--include-all",

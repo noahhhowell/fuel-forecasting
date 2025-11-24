@@ -55,10 +55,20 @@ class FuelForecaster:
         """
         site_ids = [site_id] if site_id else None
         grades = [grade] if grade else None
+        start_date_str = (
+            pd.to_datetime(start_date).strftime("%Y-%m-%d")
+            if start_date is not None
+            else None
+        )
+        end_date_str = (
+            pd.to_datetime(end_date).strftime("%Y-%m-%d")
+            if end_date is not None
+            else None
+        )
 
         df = self.db.get_sales_data(
-            start_date=start_date,
-            end_date=end_date,
+            start_date=start_date_str,
+            end_date=end_date_str,
             site_ids=site_ids,
             grades=grades,
             exclude_estimated=True,
@@ -139,7 +149,10 @@ class FuelForecaster:
         return df
 
     def check_data_sufficiency(
-        self, site_id: Optional[str] = None, grade: Optional[str] = None
+        self,
+        site_id: Optional[str] = None,
+        grade: Optional[str] = None,
+        history_end_month: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Check if there's sufficient data for forecasting
@@ -148,7 +161,11 @@ class FuelForecaster:
             Dictionary with sufficiency info
         """
         try:
-            monthly_data = self.prepare_monthly_data(site_id=site_id, grade=grade)
+            monthly_data = self.prepare_monthly_data(
+                site_id=site_id,
+                grade=grade,
+                end_date=self._get_history_end_date(history_end_month),
+            )
             months_available = len(monthly_data)
             is_sufficient = months_available >= self.min_months_data
 
@@ -197,9 +214,9 @@ class FuelForecaster:
                 model = available_models[model_name]()
                 model.fit(data)
                 trained_models[model_name] = model
-                logger.debug(f"✓ {model_name}")
+                logger.debug(f"Trained model: {model_name}")
             except Exception as e:
-                logger.warning(f"✗ {model_name}: {e}")
+                logger.warning(f"Training failed for {model_name}: {e}")
 
         self.models = trained_models
         return trained_models
@@ -211,6 +228,7 @@ class FuelForecaster:
         grade: Optional[str] = None,
         models_to_use: Optional[List[str]] = None,
         monthly_data: Optional[pd.DataFrame] = None,
+        history_end_month: Optional[str] = None,
     ) -> pd.DataFrame:
         """
         Generate forecast for a specific month
@@ -221,17 +239,21 @@ class FuelForecaster:
             grade: Specific grade (None for all)
             models_to_use: Specific models to use
             monthly_data: Pre-computed monthly data (for caching in bulk forecasts)
+            history_end_month: Only use history up to and including this month (YYYY-MM)
 
         Returns:
             DataFrame with forecasts from all models
         """
         # Normalize target month to first day of month
         target_date = pd.to_datetime(target_month).to_period("M").to_timestamp()
+        history_end_date = self._get_history_end_date(history_end_month)
 
         # Use cached data or prepare fresh
         if monthly_data is None:
             # Check data sufficiency (log warning if low, but don't block)
-            check = self.check_data_sufficiency(site_id=site_id, grade=grade)
+            check = self.check_data_sufficiency(
+                site_id=site_id, grade=grade, history_end_month=history_end_month
+            )
             if not check["sufficient"]:
                 logger.warning(
                     f"Low data warning: {check['months_available']} months "
@@ -239,7 +261,9 @@ class FuelForecaster:
                 )
 
             # Prepare data with outlier handling
-            monthly_data = self.prepare_monthly_data(site_id=site_id, grade=grade)
+            monthly_data = self.prepare_monthly_data(
+                site_id=site_id, grade=grade, end_date=history_end_date
+            )
 
         last_date = monthly_data["date"].max()
 
@@ -317,6 +341,8 @@ class FuelForecaster:
         models_to_use: Optional[List[str]] = None,
         output_path: Optional[str] = None,
         skip_insufficient: bool = True,
+        history_end_month: Optional[str] = None,
+        include_actuals: bool = False,
     ) -> pd.DataFrame:
         """
         Generate forecasts for multiple configurations with progress tracking
@@ -327,16 +353,23 @@ class FuelForecaster:
             models_to_use: Specific models to use
             output_path: Output Excel file path
             skip_insufficient: Skip items with insufficient data
+            history_end_month: Only use history up to and including this month (YYYY-MM)
+            include_actuals: Attach actuals/error columns for target month if available
 
         Returns:
             DataFrame with all forecasts
         """
         all_forecasts = []
         skipped = []
+        history_end_date = self._get_history_end_date(history_end_month)
 
         if by == "total":
             logger.info(f"Generating total forecast for {target_month}")
-            forecast = self.generate_forecast(target_month, models_to_use=models_to_use)
+            forecast = self.generate_forecast(
+                target_month,
+                models_to_use=models_to_use,
+                history_end_month=history_end_month,
+            )
             all_forecasts.append(forecast)
 
         elif by == "grade":
@@ -349,11 +382,14 @@ class FuelForecaster:
                 logger.info(f"  [{i}/{len(grades)}] Grade: {grade}")
                 try:
                     forecast = self.generate_forecast(
-                        target_month, grade=grade, models_to_use=models_to_use
+                        target_month,
+                        grade=grade,
+                        models_to_use=models_to_use,
+                        history_end_month=history_end_month,
                     )
                     all_forecasts.append(forecast)
                 except Exception as e:
-                    logger.warning(f"  ✗ Failed: {e}")
+                    logger.warning(f"  - Failed: {e}")
                     skipped.append({"grade": grade, "reason": str(e)})
 
         elif by == "site":
@@ -369,7 +405,7 @@ class FuelForecaster:
                 try:
                     # Cache monthly data (avoid recomputing in check + forecast)
                     site_monthly_data = self.prepare_monthly_data(
-                        site_id=row["site_id"]
+                        site_id=row["site_id"], end_date=history_end_date
                     )
                     months_available = len(site_monthly_data)
 
@@ -389,12 +425,13 @@ class FuelForecaster:
                         site_id=row["site_id"],
                         models_to_use=models_to_use,
                         monthly_data=site_monthly_data,
+                        history_end_month=history_end_month,
                     )
                     forecast["site_name"] = row["site"]
                     all_forecasts.append(forecast)
 
                 except Exception as e:
-                    logger.warning(f"  ✗ Site {row['site_id']}: {e}")
+                    logger.warning(f"  - Site {row['site_id']}: {e}")
                     skipped.append(
                         {
                             "site_id": row["site_id"],
@@ -418,7 +455,9 @@ class FuelForecaster:
                 try:
                     # Cache monthly data (avoid recomputing in check + forecast)
                     combo_monthly_data = self.prepare_monthly_data(
-                        site_id=row["site_id"], grade=row["grade"]
+                        site_id=row["site_id"],
+                        grade=row["grade"],
+                        end_date=history_end_date,
                     )
                     months_available = len(combo_monthly_data)
 
@@ -440,13 +479,14 @@ class FuelForecaster:
                         grade=row["grade"],
                         models_to_use=models_to_use,
                         monthly_data=combo_monthly_data,
+                        history_end_month=history_end_month,
                     )
                     forecast["site_name"] = row["site"]
                     all_forecasts.append(forecast)
 
                 except Exception as e:
                     logger.warning(
-                        f"  ✗ Site {row['site_id']}, Grade {row['grade']}: {e}"
+                        f"  - Site {row['site_id']}, Grade {row['grade']}: {e}"
                     )
                     skipped.append(
                         {
@@ -465,12 +505,17 @@ class FuelForecaster:
 
         # Combine results
         combined = pd.concat(all_forecasts, ignore_index=True)
+        if include_actuals:
+            combined, summary = self._attach_actuals(
+                combined, by=by, target_month=target_month
+            )
+            combined.attrs["actuals_summary"] = summary
 
         # Log summary
         logger.info("\nForecast Summary:")
-        logger.info(f"  ✓ Generated: {len(all_forecasts)} forecasts")
+        logger.info(f"  Generated: {len(all_forecasts)} forecasts")
         if skipped:
-            logger.info(f"  ⊘ Skipped: {len(skipped)} items")
+            logger.info(f"  Skipped: {len(skipped)} items")
 
         # Export to Excel
         if output_path:
@@ -487,7 +532,7 @@ class FuelForecaster:
             self._export_to_csv(forecasts, skipped, output_path)
         else:
             self._export_to_excel(forecasts, skipped, output_path)
-        logger.info(f"  → Saved to: {output_path}")
+        logger.info(f"  Saved to: {output_path}")
 
     def _export_to_excel(
         self, forecasts: pd.DataFrame, skipped: List[Dict], output_path: str
@@ -551,7 +596,7 @@ class FuelForecaster:
             skipped_df = pd.DataFrame(skipped)
             skipped_path = base.with_name(f"{base.stem}_skipped.csv")
             skipped_df.to_csv(skipped_path, index=False)
-            logger.info(f"  → Skipped items saved to: {skipped_path}")
+            logger.info(f"  Skipped items saved to: {skipped_path}")
 
         summary = (
             forecasts.groupby("model")["forecast_volume"]
@@ -561,4 +606,109 @@ class FuelForecaster:
         summary.columns = ["Model", "Count", "Total", "Average", "Min", "Max"]
         summary_path = base.with_name(f"{base.stem}_summary.csv")
         summary.to_csv(summary_path, index=False)
-        logger.info(f"  → Summary saved to: {summary_path}")
+        logger.info(f"  Summary saved to: {summary_path}")
+
+    def _get_history_end_date(
+        self, history_end_month: Optional[str]
+    ) -> Optional[pd.Timestamp]:
+        """Convert YYYY-MM to the last day of that month"""
+        if not history_end_month:
+            return None
+        period = pd.to_datetime(history_end_month).to_period("M")
+        return period.to_timestamp(how="end")
+
+    def _get_actuals_for_month(self, target_month: str, by: str) -> pd.DataFrame:
+        """Aggregate actual volumes for the target month at the requested level"""
+        period = pd.to_datetime(target_month).to_period("M")
+        start = period.to_timestamp()
+        end = period.to_timestamp(how="end")
+
+        data = self.db.get_sales_data(
+            start_date=start.strftime("%Y-%m-%d"),
+            end_date=end.strftime("%Y-%m-%d"),
+            exclude_estimated=True,
+        )
+
+        if data.empty:
+            return pd.DataFrame()
+
+        if by == "total":
+            actuals = pd.DataFrame(
+                [
+                    {
+                        "site_id": "ALL",
+                        "grade": "ALL",
+                        "target_month": target_month,
+                        "actual_volume": data["volume"].sum(),
+                    }
+                ]
+            )
+        elif by == "grade":
+            actuals = (
+                data.groupby("grade")["volume"]
+                .sum()
+                .reset_index()
+                .rename(columns={"volume": "actual_volume"})
+            )
+            actuals["target_month"] = target_month
+            actuals["site_id"] = "ALL"
+        elif by == "site":
+            actuals = (
+                data.groupby("site_id")["volume"]
+                .sum()
+                .reset_index()
+                .rename(columns={"volume": "actual_volume"})
+            )
+            actuals["target_month"] = target_month
+            actuals["grade"] = "ALL"
+        elif by == "site_grade":
+            actuals = (
+                data.groupby(["site_id", "grade"])["volume"]
+                .sum()
+                .reset_index()
+                .rename(columns={"volume": "actual_volume"})
+            )
+            actuals["target_month"] = target_month
+        else:
+            raise ValueError("Invalid 'by' value for actuals aggregation")
+
+        return actuals[["site_id", "grade", "target_month", "actual_volume"]]
+
+    def _attach_actuals(
+        self, forecasts: pd.DataFrame, by: str, target_month: str
+    ) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]]]:
+        """Merge actuals and compute simple error metrics"""
+        actuals = self._get_actuals_for_month(target_month, by)
+
+        if actuals.empty:
+            logger.info("  No actuals available for target month; skipping comparison")
+            return forecasts, {}
+
+        merged = forecasts.merge(
+            actuals,
+            on=["site_id", "grade", "target_month"],
+            how="left",
+        )
+
+        if "actual_volume" not in merged.columns:
+            return merged, {}
+
+        merged["error"] = merged["forecast_volume"] - merged["actual_volume"]
+        merged["abs_error"] = merged["error"].abs()
+        merged["ape"] = merged["abs_error"] / merged["actual_volume"].replace(
+            0, np.nan
+        )
+
+        metrics: Dict[str, Dict[str, float]] = {}
+        valid_mask = merged["actual_volume"].notna()
+
+        for model, group in merged[valid_mask].groupby("model"):
+            ape_series = group["ape"].dropna()
+            metrics[model] = {
+                "count": int(len(group)),
+                "mae": float(group["abs_error"].mean()) if not group.empty else None,
+                "mape": float(ape_series.mean()) if not ape_series.empty else None,
+                "median_ape": float(ape_series.median()) if not ape_series.empty else None,
+            }
+
+        return merged, metrics

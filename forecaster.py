@@ -31,6 +31,8 @@ class FuelForecaster:
         self.db = database
         self.min_months_data = min_months_data
         self.models = {}
+        # Softer floor for sparse site/grade combos; allows forecasting with fewer months
+        self.soft_min_months = max(6, min(12, self.min_months_data))
 
     def prepare_monthly_data(
         self,
@@ -39,6 +41,7 @@ class FuelForecaster:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         handle_outliers: bool = True,
+        fill_gaps: bool = True,
     ) -> pd.DataFrame:
         """
         Prepare monthly aggregated data with outlier detection
@@ -49,6 +52,8 @@ class FuelForecaster:
             start_date: Optional start date
             end_date: Optional end date
             handle_outliers: Apply outlier detection/handling (default: True)
+            fill_gaps: Fill missing months via interpolation (default: True).
+                       Set False for snaive to preserve exact historical values.
 
         Returns:
             DataFrame with monthly volume data
@@ -82,41 +87,104 @@ class FuelForecaster:
 
         result = monthly[["date", "volume"]].copy()
 
+        # Fill missing months to keep seasonality aligned on sparse series
+        # Skip for snaive which needs exact historical values without interpolation
+        if fill_gaps:
+            result = self._fill_monthly_gaps(result, site_id=site_id, grade=grade)
+
         # Outlier detection and handling (critical for individual site accuracy)
         if handle_outliers and len(result) >= 12:
             result = self._handle_outliers(result, site_id)
 
         return result
 
+    def _fill_monthly_gaps(
+        self, data: pd.DataFrame, site_id: Optional[str] = None, grade: Optional[str] = None
+    ) -> pd.DataFrame:
+        """Reindex to full monthly range and fill missing months."""
+        if data.empty:
+            return data
+
+        start = data["date"].min()
+        end = data["date"].max()
+        full_range = pd.date_range(start=start, end=end, freq="MS")
+
+        reindexed = data.set_index("date").reindex(full_range)
+        missing = int(reindexed["volume"].isna().sum())
+
+        if missing > 0:
+            reindexed["volume"] = (
+                reindexed["volume"]
+                .interpolate(limit_direction="both")
+                .ffill()
+                .bfill()
+            )
+            reindexed["volume"] = reindexed["volume"].clip(lower=0.0)
+
+            site_label = f"{site_id}" if site_id else "ALL"
+            grade_label = f"{grade}" if grade else "ALL"
+            logger.info(
+                f"Filled {missing} missing month(s) for site {site_label}, grade {grade_label}"
+            )
+
+        reindexed = reindexed.reset_index().rename(columns={"index": "date"})
+        return reindexed
+
     def _handle_outliers(
         self, data: pd.DataFrame, site_id: Optional[str] = None
     ) -> pd.DataFrame:
         """
-        Detect and handle outliers using MAD method with site-specific logging
+        Detect and handle outliers using rolling-window MAD method.
 
-        MAD (Median Absolute Deviation) is more robust than IQR for asymmetric distributions
-        Outliers are capped at boundaries rather than removed to preserve time series continuity
+        Uses a rolling window (last 18 months) to compute statistics, which adapts
+        to legitimate business changes (growth, new customers, etc.) while still
+        catching true data errors (typos, system glitches).
+
+        Outliers are capped at boundaries rather than removed to preserve time series continuity.
         """
         df = data.copy()
-        volumes = df["volume"].values
 
-        # Use MAD method (more robust than IQR, especially for asymmetric distributions)
-        median = np.median(volumes)
-        MAD = np.median(np.abs(volumes - median))
+        # Use rolling window for statistics (adapts to business changes)
+        # 18 months captures seasonality while being responsive to trends
+        window_size = min(18, len(df))
+        recent_data = df.tail(window_size)
+        recent_volumes = recent_data["volume"].values
+
+        # Clip extreme spikes relative to rolling median to avoid single-month blowups
+        if len(df) >= 4:
+            rolling_median = (
+                df["volume"].rolling(window=6, min_periods=1).median().replace(0, np.nan)
+            )
+            # More permissive: 8x rolling median instead of 5x
+            spike_cap = rolling_median * 8
+            spike_mask = df["volume"] > spike_cap.fillna(df["volume"].max() * 2)
+            if spike_mask.any():
+                capped = int(spike_mask.sum())
+                df.loc[spike_mask, "volume"] = spike_cap[spike_mask].fillna(
+                    df["volume"].median()
+                )
+                logger.info(
+                    f"  {site_id or 'Dataset'}: Capped {capped} spike(s) at 8x rolling median"
+                )
+
+        # Use MAD method on RECENT data (more robust to business changes)
+        median = np.median(recent_volumes)
+        MAD = np.median(np.abs(recent_volumes - median))
 
         # Guard against degenerate series (MAD==0 or NaN)
         if not (MAD > 0 and np.isfinite(MAD)):
-            # Degenerate series: use a simple ±30% band around median
-            lower_bound = max(0.0, median * 0.7)
-            upper_bound = median * 1.3
+            # Degenerate series: use a wider band
+            lower_bound = max(0.0, median * 0.5)
+            upper_bound = median * 2.0
         else:
-            # Define outlier boundaries with zero floor (volume cannot be negative)
-            # Using 3.0 * MAD for lower bound to catch data errors
-            # Using 5.0 * median for upper bound to allow valid high demand (holidays, etc.)
-            lower_bound = max(0.0, median - 3.0 * MAD)
-            upper_bound = median * 5.0  # Allow valid high demand, only clip data errors
+            # Define outlier boundaries using recent statistics
+            # Lower: catch data errors (zeros, negative-like entries)
+            # Upper: use MAD-based bound that adapts to recent variance
+            lower_bound = max(0.0, median - 4.0 * MAD)
+            upper_bound = median + 6.0 * MAD  # MAD-based, adapts to recent variance
 
         # Identify outliers
+        volumes = df["volume"].values
         outlier_mask = (volumes < lower_bound) | (volumes > upper_bound)
         outlier_indices = df.index[outlier_mask]
         outlier_count = len(outlier_indices)
@@ -137,6 +205,48 @@ class FuelForecaster:
             )
 
         return df
+
+    def _assess_data_quality(self, months_available: int) -> Tuple[str, Optional[str]]:
+        """
+        Categorize data sufficiency for transparency in outputs.
+        Returns (label, note).
+        """
+        if months_available >= self.min_months_data:
+            return "ok", None
+        if months_available >= self.soft_min_months:
+            return (
+                "sparse",
+                f"{months_available} months (<{self.min_months_data})",
+            )
+        return (
+            "very_sparse",
+            f"{months_available} months (<{self.min_months_data}); high uncertainty",
+        )
+
+    def _fallback_forecast_value(
+        self, data: pd.DataFrame, months_ahead: int, note: Optional[str]
+    ) -> float:
+        """
+        Generate a conservative fallback forecast using median and simple trend.
+        """
+        recent = data.tail(min(6, len(data)))
+        median_recent = float(recent["volume"].median())
+
+        trend = 0.0
+        if len(recent) >= 3:
+            x = np.arange(len(recent))
+            try:
+                trend = float(np.polyfit(x, recent["volume"].values, 1)[0])
+            except Exception:
+                trend = 0.0
+
+        fallback = median_recent + trend * months_ahead
+        fallback = max(0.0, fallback)
+
+        logger.info(
+            f"Using fallback forecast (median/trend). Months={len(data)}, Note={note or 'none'}"
+        )
+        return fallback
 
     def check_data_sufficiency(
         self, site_id: Optional[str] = None, grade: Optional[str] = None
@@ -197,7 +307,7 @@ class FuelForecaster:
                 model = available_models[model_name]()
                 model.fit(data)
                 trained_models[model_name] = model
-                logger.debug(f"✓ {model_name}")
+                logger.debug(f"Trained model {model_name}")
             except Exception as e:
                 logger.warning(f"✗ {model_name}: {e}")
 
@@ -211,6 +321,7 @@ class FuelForecaster:
         grade: Optional[str] = None,
         models_to_use: Optional[List[str]] = None,
         monthly_data: Optional[pd.DataFrame] = None,
+        monthly_data_raw: Optional[pd.DataFrame] = None,
     ) -> pd.DataFrame:
         """
         Generate forecast for a specific month
@@ -220,7 +331,8 @@ class FuelForecaster:
             site_id: Specific site (None for all)
             grade: Specific grade (None for all)
             models_to_use: Specific models to use
-            monthly_data: Pre-computed monthly data (for caching in bulk forecasts)
+            monthly_data: Pre-computed monthly data WITH outlier handling (for ETS)
+            monthly_data_raw: Pre-computed monthly data WITHOUT outlier handling (for snaive)
 
         Returns:
             DataFrame with forecasts from all models
@@ -238,8 +350,12 @@ class FuelForecaster:
                     f"(recommended: {check['months_required']}). Forecasting anyway."
                 )
 
-            # Prepare data with outlier handling
-            monthly_data = self.prepare_monthly_data(site_id=site_id, grade=grade)
+            # Prepare data with outlier handling (for ETS)
+            monthly_data = self.prepare_monthly_data(site_id=site_id, grade=grade, handle_outliers=True)
+
+        # Prepare raw data for snaive (no outlier handling, no gap filling - use exact historical values)
+        if monthly_data_raw is None:
+            monthly_data_raw = self.prepare_monthly_data(site_id=site_id, grade=grade, handle_outliers=False, fill_gaps=False)
 
         last_date = monthly_data["date"].max()
 
@@ -251,20 +367,35 @@ class FuelForecaster:
         if months_ahead <= 0:
             raise ValueError(f"Target month {target_month} is not in the future")
 
-        # Train models
-        trained_models = self.train_models(
-            monthly_data, models_to_use=models_to_use
-        )
+        months_available = len(monthly_data)
+        data_quality, quality_note = self._assess_data_quality(months_available)
 
-        if not trained_models:
-            raise ValueError("No models were successfully trained")
+        # Get available models
+        available_models = get_available_models()
+        if models_to_use is None:
+            models_to_use = list(available_models.keys())
 
-        # Generate predictions
+        # Generate predictions - train each model with appropriate data
         results = []
         forecasts_for_ensemble = []
+        note = quality_note
+        fallback_value = None
 
-        for model_name, model in trained_models.items():
+        for model_name in models_to_use:
+            if model_name not in available_models:
+                logger.warning(f"Model {model_name} not available")
+                continue
+
             try:
+                model = available_models[model_name]()
+
+                # Use raw data for snaive (preserves actual historical values)
+                # Use outlier-handled data for ETS (benefits from cleaned data)
+                if model_name == "snaive":
+                    model.fit(monthly_data_raw)
+                else:
+                    model.fit(monthly_data)
+
                 predictions = model.predict(periods=months_ahead)
 
                 # Get forecast for target month
@@ -284,12 +415,35 @@ class FuelForecaster:
                         "forecast_volume": forecast_value,
                         "site_id": site_id or "ALL",
                         "grade": grade or "ALL",
+                        "months_available": months_available,
+                        "data_quality": data_quality,
+                        "note": note,
                     }
                 )
             except Exception as e:
                 logger.warning(f"Prediction failed for {model_name}: {e}")
 
+        if not forecasts_for_ensemble:
+            fallback_value = self._fallback_forecast_value(
+                monthly_data, months_ahead, quality_note
+            )
+            forecasts_for_ensemble.append(fallback_value)
+            results.append(
+                {
+                    "model": "FALLBACK",
+                    "target_month": target_month,
+                    "forecast_volume": fallback_value,
+                    "site_id": site_id or "ALL",
+                    "grade": grade or "ALL",
+                    "months_available": months_available,
+                    "data_quality": data_quality,
+                    "note": (note or "Using fallback due to model failure"),
+                }
+            )
+
         results_df = pd.DataFrame(results)
+
+        ensemble_note = note or ("Used fallback forecast" if fallback_value is not None else None)
 
         # Add ensemble (robust median instead of mean)
         if forecasts_for_ensemble:
@@ -303,6 +457,9 @@ class FuelForecaster:
                         "forecast_volume": ensemble_forecast,
                         "site_id": site_id or "ALL",
                         "grade": grade or "ALL",
+                        "months_available": months_available,
+                        "data_quality": data_quality,
+                        "note": ensemble_note,
                     }
                 ]
             )
@@ -367,9 +524,12 @@ class FuelForecaster:
                     logger.info(f"  Progress: {i+1}/{total} sites")
 
                 try:
-                    # Cache monthly data (avoid recomputing in check + forecast)
+                    # Cache monthly data - both processed (for ETS) and raw (for snaive)
                     site_monthly_data = self.prepare_monthly_data(
-                        site_id=row["site_id"]
+                        site_id=row["site_id"], handle_outliers=True
+                    )
+                    site_monthly_data_raw = self.prepare_monthly_data(
+                        site_id=row["site_id"], handle_outliers=False, fill_gaps=False
                     )
                     months_available = len(site_monthly_data)
 
@@ -389,6 +549,7 @@ class FuelForecaster:
                         site_id=row["site_id"],
                         models_to_use=models_to_use,
                         monthly_data=site_monthly_data,
+                        monthly_data_raw=site_monthly_data_raw,
                     )
                     forecast["site_name"] = row["site"]
                     all_forecasts.append(forecast)
@@ -416,13 +577,16 @@ class FuelForecaster:
                     logger.info(f"  Progress: {i+1}/{total} combinations")
 
                 try:
-                    # Cache monthly data (avoid recomputing in check + forecast)
+                    # Cache monthly data - both processed (for ETS) and raw (for snaive)
                     combo_monthly_data = self.prepare_monthly_data(
-                        site_id=row["site_id"], grade=row["grade"]
+                        site_id=row["site_id"], grade=row["grade"], handle_outliers=True
+                    )
+                    combo_monthly_data_raw = self.prepare_monthly_data(
+                        site_id=row["site_id"], grade=row["grade"], handle_outliers=False, fill_gaps=False
                     )
                     months_available = len(combo_monthly_data)
 
-                    if months_available < self.min_months_data and skip_insufficient:
+                    if months_available < self.soft_min_months and skip_insufficient:
                         skipped.append(
                             {
                                 "site_id": row["site_id"],
@@ -440,6 +604,7 @@ class FuelForecaster:
                         grade=row["grade"],
                         models_to_use=models_to_use,
                         monthly_data=combo_monthly_data,
+                        monthly_data_raw=combo_monthly_data_raw,
                     )
                     forecast["site_name"] = row["site"]
                     all_forecasts.append(forecast)

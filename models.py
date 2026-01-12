@@ -72,21 +72,19 @@ class SeasonalNaiveModel(ForecastModel):
         self.period = 12
 
     def fit(self, data: pd.DataFrame):
-        """Fit Seasonal Naive model (just stores training data)"""
+        """Fit Seasonal Naive model (stores training data with dates for month lookup)"""
         try:
             self._validate_input(data)
 
-            # Ensure strictly monthly frequency to prevent seasonal shifts
+            # Ensure date column is datetime
+            data = data.copy()
             data['date'] = pd.to_datetime(data['date'])
-            full_range = pd.date_range(start=data['date'].min(), end=data['date'].max(), freq='MS')
+            data = data.sort_values('date').reset_index(drop=True)
 
-            # Reindex and forward fill to handle missing months (prevents "12 months ago" being wrong)
-            data = data.set_index('date').reindex(full_range).ffill().reset_index()
-            if 'index' in data.columns:
-                data = data.rename(columns={'index': 'date'})
-
-            self.train_volumes = data["volume"].reset_index(drop=True).values
-            self.last_date = data["date"].max()
+            # Store both volumes and dates for same-month lookup
+            self.train_volumes = data["volume"].values
+            self.train_dates = data["date"].values
+            self.last_date = pd.Timestamp(data["date"].max())
             self.is_fitted = True
             logger.debug(f"SeasonalNaive: Trained on {len(self.train_volumes)} months")
         except Exception as e:
@@ -94,7 +92,7 @@ class SeasonalNaiveModel(ForecastModel):
             raise
 
     def predict(self, periods: int) -> pd.DataFrame:
-        """Generate Seasonal Naive predictions"""
+        """Generate Seasonal Naive predictions using same-month-last-year values"""
         if not self.is_fitted:
             raise ValueError("Model not fitted")
 
@@ -105,21 +103,30 @@ class SeasonalNaiveModel(ForecastModel):
                 "This should not happen if model was properly fitted."
             )
 
-        predictions = []
-
-        if len(self.train_volumes) < self.period:
-            # Fallback to naive last value if insufficient seasonal history
-            forecast_values = np.repeat(self.train_volumes[-1], periods)
-        else:
-            # Use seasonal pattern from last full cycle
-            last_cycle = self.train_volumes[-self.period :]
-            reps = int(np.ceil(periods / self.period))
-            forecast_values = np.tile(last_cycle, reps)[:periods]
-
-        # Generate future dates
+        # Generate future dates first
         future_dates = [
             self.last_date + relativedelta(months=i + 1) for i in range(periods)
         ]
+
+        # Build forecast by looking up same-month values from training data
+        forecast_values = []
+        for future_date in future_dates:
+            target_month = future_date.month
+
+            # Find the most recent occurrence of this month in training data
+            # Search backwards through training data for same month
+            found_value = None
+            for i in range(len(self.train_dates) - 1, -1, -1):
+                train_date = pd.Timestamp(self.train_dates[i])
+                if train_date.month == target_month:
+                    found_value = self.train_volumes[i]
+                    break
+
+            if found_value is not None:
+                forecast_values.append(found_value)
+            else:
+                # No same-month data available - fall back to last known value
+                forecast_values.append(self.train_volumes[-1])
 
         # Clamp to non-negative
         forecast_values = np.maximum(0.0, forecast_values)

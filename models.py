@@ -110,6 +110,7 @@ class SeasonalNaiveModel(ForecastModel):
 
         # Build forecast by looking up same-month values from training data
         forecast_values = []
+        used_fallback = []  # Track which periods used fallback
         for future_date in future_dates:
             target_month = future_date.month
 
@@ -124,15 +125,33 @@ class SeasonalNaiveModel(ForecastModel):
 
             if found_value is not None:
                 forecast_values.append(found_value)
+                used_fallback.append(False)
             else:
                 # No same-month data available - fall back to last known value
                 forecast_values.append(self.train_volumes[-1])
+                used_fallback.append(True)
+                logger.debug(
+                    f"SeasonalNaive: No data for month {target_month}, using fallback"
+                )
 
         # Clamp to non-negative
         forecast_values = np.maximum(0.0, forecast_values)
 
+        # Store fallback info for external access
+        self.last_prediction_used_fallback = any(used_fallback)
+        self.fallback_months = [
+            future_dates[i].strftime("%Y-%m")
+            for i, fb in enumerate(used_fallback)
+            if fb
+        ]
+
         return pd.DataFrame(
-            {"date": future_dates, "forecast": forecast_values, "model": self.name}
+            {
+                "date": future_dates,
+                "forecast": forecast_values,
+                "model": self.name,
+                "used_fallback": used_fallback,
+            }
         )
 
 

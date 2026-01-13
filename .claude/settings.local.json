@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(uv run python:*)",
+      "Bash(del diagnose_forecast.py)",
+      "Bash(cd:*)",
+      "Bash(cat:*)",
+      "Bash(git checkout:*)",
+      "Bash(git merge:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push)",
+      "Bash(find:*)",
+      "Bash(python:*)",
+      "Bash(findstr:*)",
+      "Bash(.venvScriptspython.exe -c \"\nfrom models import SeasonalNaiveModel\nimport pandas as pd\nimport numpy as np\n\n# Create test data with a gap \\(missing January\\)\ndates = pd.date_range\\(''2023-02-01'', ''2024-12-01'', freq=''MS''\\)  # Missing Jan 2023\nvolumes = np.random.uniform\\(100, 200, len\\(dates\\)\\)\n\ndata = pd.DataFrame\\({''date'': dates, ''volume'': volumes}\\)\nprint\\(f''Training data months: {[d.strftime\\(\"\"%Y-%m\"\"\\) for d in dates[:4]]}...''\\)\n\nmodel = SeasonalNaiveModel\\(\\)\nmodel.fit\\(data\\)\n\n# Forecast Jan 2025 - should trigger fallback since no Jan in training\npredictions = model.predict\\(periods=1\\)\nprint\\(f''Prediction for {predictions[\"\"date\"\"].iloc[0].strftime\\(\"\"%Y-%m\"\"\\)}:''\\)\nprint\\(f''  Forecast: {predictions[\"\"forecast\"\"].iloc[0]:.2f}''\\)\nprint\\(f''  Used fallback: {predictions[\"\"used_fallback\"\"].iloc[0]}''\\)\nprint\\(f''  Model fallback flag: {model.last_prediction_used_fallback}''\\)\nprint\\(f''  Fallback months: {model.fallback_months}''\\)\n\")",
+      "Bash(\"C:\\\\Users\\\\noah.howell\\\\OneDrive - Alimentation Couche-Tard\\\\Documents\\\\Code\\\\fuel-forecasting\\\\.venv\\\\Scripts\\\\python.exe\" -c \"\nimport sys\nsys.path.insert\\(0, r''C:\\\\Users\\\\noah.howell\\\\OneDrive - Alimentation Couche-Tard\\\\Documents\\\\Code\\\\fuel-forecasting''\\)\nfrom models import SeasonalNaiveModel\nimport pandas as pd\nimport numpy as np\n\n# Create test data with a gap \\(missing January\\)\ndates = pd.date_range\\(''2023-02-01'', ''2024-12-01'', freq=''MS''\\)  # Missing Jan 2023\nvolumes = np.random.uniform\\(100, 200, len\\(dates\\)\\)\n\ndata = pd.DataFrame\\({''date'': dates, ''volume'': volumes}\\)\nprint\\(f''Training data: Feb 2023 to Dec 2024 \\(missing Jan\\)''\\)\n\nmodel = SeasonalNaiveModel\\(\\)\nmodel.fit\\(data\\)\n\n# Forecast Jan 2025 - should trigger fallback since no Jan in training\npredictions = model.predict\\(periods=1\\)\nprint\\(f''Prediction for {predictions[\"\"date\"\"].iloc[0].strftime\\(\"\"%Y-%m\"\"\\)}:''\\)\nprint\\(f''  Forecast: {predictions[\"\"forecast\"\"].iloc[0]:.2f}''\\)\nprint\\(f''  Used fallback: {predictions[\"\"used_fallback\"\"].iloc[0]}''\\)\nprint\\(f''  Model fallback flag: {model.last_prediction_used_fallback}''\\)\nprint\\(f''  Fallback months: {model.fallback_months}''\\)\n\")",
+      "Bash(\"C:\\\\Users\\\\noah.howell\\\\OneDrive - Alimentation Couche-Tard\\\\Documents\\\\Code\\\\fuel-forecasting\\\\.venv\\\\Scripts\\\\python.exe\" -c:*)",
+      "Bash(ls -la \"C:\\\\Users\\\\noah.howell\\\\OneDrive - Alimentation Couche-Tard\\\\Documents\\\\Code\\\\fuel-forecasting\"\"/*.py 2>/dev/null || dir /b \"C:Usersnoah.howellOneDrive - Alimentation Couche-TardDocumentsCodefuel-forecasting*.py \")",
+      "Bash(del test_reconciled.xlsx)"
+    ]
+  }
+}

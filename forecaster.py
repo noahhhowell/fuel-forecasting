@@ -702,7 +702,6 @@ class FuelForecaster:
                         monthly_data_raw=site_monthly_data_raw,
                         show_yoy=show_yoy,
                     )
-                    forecast["site_name"] = row["site"]
                     all_forecasts.append(forecast)
 
                 except Exception as e:
@@ -758,7 +757,6 @@ class FuelForecaster:
                         monthly_data_raw=combo_monthly_data_raw,
                         show_yoy=show_yoy,
                     )
-                    forecast["site_name"] = row["site"]
                     all_forecasts.append(forecast)
 
                 except Exception as e:
@@ -840,8 +838,6 @@ class FuelForecaster:
 
         # Group by site and model, sum the volumes
         group_cols = ["site_id", "target_month", "model"]
-        if "site_name" in grade_data.columns:
-            group_cols.insert(1, "site_name")
 
         # Build aggregation dict
         agg_dict = {col: "sum" for col in sum_cols if col in grade_data.columns}
@@ -862,7 +858,6 @@ class FuelForecaster:
         # Reorder columns for clarity
         desired_order = [
             "site_id",
-            "site_name",
             "target_month",
             "model",
             "forecast_volume",
@@ -1066,7 +1061,6 @@ class FuelForecaster:
             ]
             ordered_cols = [c for c in desired_order if c in forecasts.columns]
 
-            # Keep any extra columns (e.g., site_name) after the requested order
             remaining_cols = [
                 c for c in forecasts.columns if c not in ordered_cols
             ]

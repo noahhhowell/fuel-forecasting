@@ -209,7 +209,7 @@ def forecast_command(args):
             if not ensemble.empty:
                 print("\nTop 5 highest forecasts:")
                 top5 = ensemble.nlargest(5, "forecast_volume")[
-                    ["site_id", "site_name", "grade", "forecast_volume"]
+                    ["site_id", "grade", "forecast_volume"]
                 ]
                 for _, row in top5.iterrows():
                     grade_str = f" - {row['grade']}" if row["grade"] != "ALL" else ""

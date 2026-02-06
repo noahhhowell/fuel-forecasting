@@ -205,6 +205,20 @@ python cli.py status
 python cli.py forecast 2026-04 --by site --output forecasts/2026-04_site.xlsx
 ```
 
+## Backtesting
+
+Evaluate forecast accuracy against historical actuals:
+
+```bash
+# Test against last 6 months (default)
+python backtest.py
+
+# Test against last 12 months, save results to Excel
+python backtest.py --months 12 --output backtest_results.xlsx
+```
+
+Holds out recent months, generates forecasts using only prior data, and reports MAPE (Mean Absolute Percentage Error) per site.
+
 ## Expected Runtimes
 
 | Level | Approximate time |

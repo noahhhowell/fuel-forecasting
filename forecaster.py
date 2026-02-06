@@ -634,7 +634,7 @@ class FuelForecaster:
 
         Args:
             target_month: Target month 'YYYY-MM'
-            by: 'total', 'grade', 'site', or 'site_grade'
+            by: 'grade', 'site', or 'site_grade'
             models_to_use: Specific models to use
             output_path: Output Excel file path
             skip_insufficient: Skip items with insufficient data
@@ -646,12 +646,7 @@ class FuelForecaster:
         all_forecasts = []
         skipped = []
 
-        if by == "total":
-            logger.info(f"Generating total forecast for {target_month}")
-            forecast = self.generate_forecast(target_month, models_to_use=models_to_use, show_yoy=show_yoy)
-            all_forecasts.append(forecast)
-
-        elif by == "grade":
+        if by == "grade":
             stats = self.db.get_summary_stats()
             grades = stats["fuel_grades"]
 
@@ -780,7 +775,7 @@ class FuelForecaster:
                     )
 
         else:
-            raise ValueError("by must be 'total', 'grade', 'site', or 'site_grade'")
+            raise ValueError("by must be 'grade', 'site', or 'site_grade'")
 
         if not all_forecasts:
             raise ValueError("No forecasts were successfully generated")

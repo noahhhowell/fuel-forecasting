@@ -218,19 +218,14 @@ def forecast_command(args):
                     )
 
         else:
-            # Show all models
-            print("\nForecast by Model:")
-            for _, row in forecast.iterrows():
-                print(f"  {row['model']:20s}: {row['forecast_volume']:>15,.2f} gallons")
-
-            # Highlight ensemble
+            # Grade-level: show all models per grade
             ensemble = forecast[forecast["model"] == "ENSEMBLE"]
             if not ensemble.empty:
-                print("\n" + "-" * 60)
-                print(
-                    f"RECOMMENDED (Ensemble): {ensemble['forecast_volume'].iloc[0]:,.2f} gallons"
-                )
-                print("-" * 60)
+                print("\nForecast by Grade:")
+                for _, row in ensemble.iterrows():
+                    print(
+                        f"  {row['grade']:10s}: {row['forecast_volume']:>15,.2f} gallons"
+                    )
 
         if args.output:
             print(f"\n✓ Exported to: {args.output}")
@@ -329,7 +324,7 @@ Examples:
     forecast_parser.add_argument("month", help="Target month (YYYY-MM)")
     forecast_parser.add_argument(
         "--by",
-        choices=["total", "grade", "site", "site_grade"],
+        choices=["grade", "site", "site_grade"],
         default="site",
         help="Aggregation level (default: site)",
     )

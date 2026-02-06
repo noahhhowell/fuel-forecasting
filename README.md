@@ -92,13 +92,11 @@ python cli.py forecast 2026-03 --by site --output forecasts/2026-03_site.csv
 
 | Level | What it does | Output rows |
 |-------|--------------|-------------|
-| `total` | All sites and grades combined | 3 (2 models + ensemble) |
 | `grade` | One forecast per fuel grade (UNL, PRE, DSL) | 3 x #grades |
 | `site` | One forecast per site, all grades combined | 3 x #sites |
 | `site_grade` | One forecast per site-grade combination | 3 x #combos |
 
 ```bash
-python cli.py forecast 2026-03 --by total
 python cli.py forecast 2026-03 --by grade --output grades.xlsx
 python cli.py forecast 2026-03 --by site --output sites.xlsx
 python cli.py forecast 2026-03 --by site_grade --output detailed.xlsx
@@ -108,7 +106,7 @@ python cli.py forecast 2026-03 --by site_grade --output detailed.xlsx
 
 | Flag | What it does |
 |------|--------------|
-| `--by` | Aggregation level: `total`, `grade`, `site`, `site_grade` (default: `site`) |
+| `--by` | Aggregation level: `grade`, `site`, `site_grade` (default: `site`) |
 | `--output` | Save to Excel (.xlsx) or CSV (.csv) |
 | `--model ets` | Use only ETS model |
 | `--model snaive` | Use only Seasonal Naive model |
@@ -166,18 +164,6 @@ Main forecasts go to the file you specify. Additional files are created alongsid
 
 ## Examples
 
-### Aggregate company-wide forecast
-
-```bash
-python cli.py forecast 2026-03
-
-# Output:
-# ETS:                     1,234,567.89 gallons
-# SeasonalNaive:           1,238,901.23 gallons
-# ──────────────────────────────────────────────
-# RECOMMENDED (Ensemble):  1,236,734.56 gallons
-```
-
 ### Site-level with Excel export
 
 ```bash
@@ -223,7 +209,7 @@ python cli.py forecast 2026-04 --by site --output forecasts/2026-04_site.xlsx
 
 | Level | Approximate time |
 |-------|-----------------|
-| `total` / `grade` | Under 1 minute |
+| `grade` | Under 1 minute |
 | `site` (~400 sites) | 5-10 minutes |
 | `site_grade` (~1,200 combos) | 15-30 minutes |
 

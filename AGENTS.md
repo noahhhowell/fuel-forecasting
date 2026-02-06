@@ -1,9 +1,9 @@
-﻿# Repository Guidelines
+# Repository Guidelines
 
 ## Project Structure & Module Organization
-- `cli.py` is the entrypoint for all commands (load/status/forecast) and wires together database and forecasting logic.
+- `cli.py` is the entrypoint for all commands (load/status/export/forecast) and wires together database and forecasting logic.
 - `database.py` handles SQLite reads/writes and CSV/Excel ingest; `models.py` defines ETS and seasonal naive models; `forecaster.py` runs model selection/ensemble.
-- Docs live in `README.md`, `EXAMPLES.md`, `QUICKREF.md`, and `BACKTESTING_GUIDE.md` for workflows; sample data belongs in `data/` and outputs in `forecasts/` (ignored from git).
+- All user-facing documentation is in `README.md`. Sample data belongs in `data/` and outputs in `forecasts/` (both gitignored).
 - No dedicated test suite directory yet; add `tests/` with `test_*.py` when introducing automated checks.
 
 ## Build, Test, and Development Commands
@@ -17,7 +17,7 @@
 ## Coding Style & Naming Conventions
 - Python 3.9+, 4-space indentation, keep functions and variables snake_case; classes PascalCase; constants UPPER_SNAKE.
 - Prefer type hints for public functions (`FuelDatabase`, `FuelForecaster`, model classes) and keep docstrings concise about inputs/outputs.
-- Keep column naming consistent (`site_id`, `grade`, `day`, `volume`, `target_month`); preserve ordered columns shown in README/QUICKREF.
+- Keep column naming consistent (`site_id`, `grade`, `day`, `volume`, `target_month`); preserve ordered columns shown in README.
 - Use logging (module-level logger) instead of print for diagnostics; avoid broad exceptions; raise `ValueError`/`RuntimeError` with context.
 
 ## Testing Guidelines
@@ -28,7 +28,7 @@
 ## Commit & Pull Request Guidelines
 - Follow existing history: short, imperative summaries ("Add backtesting changes", "Update CSV export"); keep scope-focused and avoid long prefixes.
 - In PRs, include: what changed, sample commands used, expected outputs/paths, and any data or flags required (`--include-all`, `--min-months`).
-- Link related issue/ticket if available; attach screenshots of Excel outputs when UI/format changes matter; update docs (README/QUICKREF/BACKTESTING_GUIDE) when user-facing behavior or file formats shift.
+- Link related issue/ticket if available; attach screenshots of Excel outputs when UI/format changes matter; update README.md when user-facing behavior or file formats shift.
 
 ## Security & Configuration Tips
 - Keep large inputs/outputs in `data/` and `forecasts/` out of version control (already in `.gitignore`); avoid committing `.venv` or SQLite DBs.

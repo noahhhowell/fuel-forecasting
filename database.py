@@ -190,10 +190,10 @@ class FuelDatabase:
 
     def _normalize_bool(self, value) -> bool:
         """Convert common truthy/falsey representations to bool"""
+        if value is None or pd.isna(value):
+            return False
         if isinstance(value, bool):
             return value
-        if value is None:
-            return False
         if isinstance(value, (int, float)):
             return bool(value)
         text = str(value).strip().lower()

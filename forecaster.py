@@ -167,6 +167,10 @@ class FuelForecaster:
                     f"  {site_id or 'Dataset'}: Capped {capped} spike(s) at 8x rolling median"
                 )
 
+        # Recompute recent volumes after spike capping so MAD uses cleaned data
+        recent_data = df.tail(window_size)
+        recent_volumes = recent_data["volume"].values
+
         # Use MAD method on RECENT data (more robust to business changes)
         median = np.median(recent_volumes)
         MAD = np.median(np.abs(recent_volumes - median))
@@ -280,9 +284,46 @@ class FuelForecaster:
         Returns:
             Percentage change (e.g., 5.2 for 5.2% increase), or None if prior year unavailable
         """
-        if prior_year_volume is None or prior_year_volume == 0:
+        # Handle None, NaN, and zero values to avoid division errors
+        if prior_year_volume is None or pd.isna(prior_year_volume) or prior_year_volume == 0:
             return None
         return ((forecast_volume - prior_year_volume) / prior_year_volume) * 100
+
+    def _get_prior_year_actual_by_grade(
+        self, target_month: str, grade: str
+    ) -> Optional[float]:
+        """
+        Get actual aggregate volume for a specific grade across all sites for prior year month.
+
+        This queries the database directly for the true historical aggregate,
+        ensuring accurate YoY comparisons in summary reports.
+
+        Args:
+            target_month: Target month in 'YYYY-MM' format
+            grade: Fuel grade to filter by
+
+        Returns:
+            Actual total volume for the grade in prior year same month, or None if unavailable
+        """
+        # Handle "ALL" grade (used in site-level forecasts) by fetching total across all grades
+        if grade == "ALL":
+            return self._get_prior_year_actual_total(target_month)
+        return self._get_prior_year_actual(target_month, site_id=None, grade=grade)
+
+    def _get_prior_year_actual_total(self, target_month: str) -> Optional[float]:
+        """
+        Get actual total volume across all sites and grades for prior year month.
+
+        This queries the database directly for the true historical total,
+        ensuring accurate YoY comparisons in BU-level summary reports.
+
+        Args:
+            target_month: Target month in 'YYYY-MM' format
+
+        Returns:
+            Actual total volume for prior year same month, or None if unavailable
+        """
+        return self._get_prior_year_actual(target_month, site_id=None, grade=None)
 
     def _fallback_forecast_value(
         self, data: pd.DataFrame, months_ahead: int, note: Optional[str]
@@ -319,7 +360,12 @@ class FuelForecaster:
             Dictionary with sufficiency info
         """
         try:
-            monthly_data = self.prepare_monthly_data(site_id=site_id, grade=grade)
+            monthly_data = self.prepare_monthly_data(
+                site_id=site_id,
+                grade=grade,
+                handle_outliers=False,
+                fill_gaps=False,
+            )
             months_available = len(monthly_data)
             is_sufficient = months_available >= self.min_months_data
 
@@ -835,6 +881,178 @@ class FuelForecaster:
 
         return site_summary
 
+    def _create_product_summary(self, forecasts: pd.DataFrame) -> pd.DataFrame:
+        """
+        Create product/grade-level summary with YoY % change.
+
+        Aggregates forecasts by grade (fuel product type) across all sites,
+        showing total volumes and YoY change at the product level.
+
+        IMPORTANT: Prior year volumes are fetched directly from the database
+        (not summed from individual forecasts) to ensure accurate YoY comparisons
+        even when individual site forecasts used imputed/historical data.
+
+        Args:
+            forecasts: DataFrame with forecast data
+
+        Returns:
+            DataFrame with product-level totals and YoY %
+        """
+        if "grade" not in forecasts.columns:
+            return pd.DataFrame()
+
+        # Filter to ENSEMBLE model for clean aggregation (avoid double-counting)
+        if "model" in forecasts.columns:
+            ensemble_data = forecasts[forecasts["model"] == "ENSEMBLE"].copy()
+            if ensemble_data.empty:
+                # Fallback to all data if no ENSEMBLE
+                ensemble_data = forecasts.copy()
+        else:
+            ensemble_data = forecasts.copy()
+
+        if ensemble_data.empty:
+            return pd.DataFrame()
+
+        # Group by grade and target_month, sum forecast volumes
+        group_cols = ["grade", "target_month"]
+        agg_dict = {"forecast_volume": "sum"}
+        if "site_id" in ensemble_data.columns:
+            agg_dict["site_id"] = "nunique"  # Count of sites included
+
+        product_summary = ensemble_data.groupby(group_cols, as_index=False).agg(agg_dict)
+        if "site_id" in product_summary.columns:
+            product_summary = product_summary.rename(columns={"site_id": "sites_included"})
+
+        # Fetch actual prior year volumes directly from database for each grade
+        # This ensures accurate YoY comparison regardless of imputation in individual forecasts
+        prior_year_volumes = []
+        prior_year_months = []
+        for _, row in product_summary.iterrows():
+            target_month = row["target_month"]
+            grade = row["grade"]
+            prior_year_vol = self._get_prior_year_actual_by_grade(target_month, grade)
+            prior_year_volumes.append(prior_year_vol)
+            # Calculate prior year month for display
+            target_date = pd.to_datetime(target_month)
+            prior_year_months.append(
+                (target_date - pd.DateOffset(years=1)).strftime("%Y-%m")
+            )
+
+        product_summary["prior_year_month"] = prior_year_months
+        product_summary["prior_year_volume"] = prior_year_volumes
+
+        # Calculate YoY change based on actual prior year aggregates
+        product_summary["yoy_change_pct"] = product_summary.apply(
+            lambda row: self._calculate_yoy_change(
+                row["forecast_volume"], row["prior_year_volume"]
+            ),
+            axis=1
+        )
+
+        # Reorder columns for clarity
+        desired_order = [
+            "grade",
+            "target_month",
+            "forecast_volume",
+            "prior_year_month",
+            "prior_year_volume",
+            "yoy_change_pct",
+            "sites_included",
+        ]
+        ordered_cols = [c for c in desired_order if c in product_summary.columns]
+        remaining_cols = [c for c in product_summary.columns if c not in ordered_cols]
+        product_summary = product_summary[ordered_cols + remaining_cols]
+
+        return product_summary
+
+    def _create_bu_summary(self, forecasts: pd.DataFrame) -> pd.DataFrame:
+        """
+        Create BU (Business Unit) level summary with YoY % change.
+
+        Aggregates all forecasts to show overall totals for the entire BU,
+        including total volumes and YoY change.
+
+        IMPORTANT: Prior year volumes are fetched directly from the database
+        (not summed from individual forecasts) to ensure accurate YoY comparisons
+        even when individual site forecasts used imputed/historical data.
+
+        Args:
+            forecasts: DataFrame with forecast data
+
+        Returns:
+            DataFrame with BU-level totals and YoY %
+        """
+        # Filter to ENSEMBLE model for clean aggregation (avoid double-counting)
+        if "model" in forecasts.columns:
+            ensemble_data = forecasts[forecasts["model"] == "ENSEMBLE"].copy()
+            if ensemble_data.empty:
+                # Fallback to all data if no ENSEMBLE
+                ensemble_data = forecasts.copy()
+        else:
+            ensemble_data = forecasts.copy()
+
+        if ensemble_data.empty:
+            return pd.DataFrame()
+
+        # Group by target_month only (BU-level = all sites, all grades)
+        group_cols = ["target_month"]
+        agg_dict = {"forecast_volume": "sum"}
+
+        # Count unique sites and grades
+        if "site_id" in ensemble_data.columns:
+            agg_dict["site_id"] = "nunique"
+        if "grade" in ensemble_data.columns:
+            agg_dict["grade"] = "nunique"
+
+        bu_summary = ensemble_data.groupby(group_cols, as_index=False).agg(agg_dict)
+
+        # Rename count columns
+        if "site_id" in bu_summary.columns:
+            bu_summary = bu_summary.rename(columns={"site_id": "sites_included"})
+        if "grade" in bu_summary.columns:
+            bu_summary = bu_summary.rename(columns={"grade": "grades_included"})
+
+        # Fetch actual prior year total volumes directly from database
+        # This ensures accurate YoY comparison regardless of imputation in individual forecasts
+        prior_year_volumes = []
+        prior_year_months = []
+        for _, row in bu_summary.iterrows():
+            target_month = row["target_month"]
+            prior_year_vol = self._get_prior_year_actual_total(target_month)
+            prior_year_volumes.append(prior_year_vol)
+            # Calculate prior year month for display
+            target_date = pd.to_datetime(target_month)
+            prior_year_months.append(
+                (target_date - pd.DateOffset(years=1)).strftime("%Y-%m")
+            )
+
+        bu_summary["prior_year_month"] = prior_year_months
+        bu_summary["prior_year_volume"] = prior_year_volumes
+
+        # Calculate YoY change based on actual prior year total
+        bu_summary["yoy_change_pct"] = bu_summary.apply(
+            lambda row: self._calculate_yoy_change(
+                row["forecast_volume"], row["prior_year_volume"]
+            ),
+            axis=1
+        )
+
+        # Reorder columns for clarity
+        desired_order = [
+            "target_month",
+            "forecast_volume",
+            "prior_year_month",
+            "prior_year_volume",
+            "yoy_change_pct",
+            "sites_included",
+            "grades_included",
+        ]
+        ordered_cols = [c for c in desired_order if c in bu_summary.columns]
+        remaining_cols = [c for c in bu_summary.columns if c not in ordered_cols]
+        bu_summary = bu_summary[ordered_cols + remaining_cols]
+
+        return bu_summary
+
     def _export_to_excel(
         self, forecasts: pd.DataFrame, skipped: List[Dict], output_path: str
     ):
@@ -869,6 +1087,22 @@ class FuelForecaster:
                 site_summary.to_excel(writer, sheet_name="Site Summary", index=False)
                 logger.info(
                     f"  → Site Summary: {len(site_summary)} reconciled site-level forecasts"
+                )
+
+            # Product Summary (grade-level aggregation with YoY %)
+            product_summary = self._create_product_summary(forecasts)
+            if not product_summary.empty:
+                product_summary.to_excel(writer, sheet_name="Product Summary", index=False)
+                logger.info(
+                    f"  → Product Summary: {len(product_summary)} product-level forecasts with YoY %"
+                )
+
+            # BU Summary (overall business unit totals with YoY %)
+            bu_summary = self._create_bu_summary(forecasts)
+            if not bu_summary.empty:
+                bu_summary.to_excel(writer, sheet_name="BU Summary", index=False)
+                logger.info(
+                    f"  → BU Summary: Overall business unit forecast with YoY %"
                 )
 
             # Skipped items (if any)
@@ -914,6 +1148,24 @@ class FuelForecaster:
             site_summary.to_csv(site_summary_path, index=False)
             logger.info(
                 f"  → Site Summary ({len(site_summary)} reconciled forecasts) saved to: {site_summary_path}"
+            )
+
+        # Product Summary (grade-level aggregation with YoY %)
+        product_summary = self._create_product_summary(forecasts)
+        if not product_summary.empty:
+            product_summary_path = base.with_name(f"{base.stem}_product_summary.csv")
+            product_summary.to_csv(product_summary_path, index=False)
+            logger.info(
+                f"  → Product Summary ({len(product_summary)} product-level forecasts with YoY %) saved to: {product_summary_path}"
+            )
+
+        # BU Summary (overall business unit totals with YoY %)
+        bu_summary = self._create_bu_summary(forecasts)
+        if not bu_summary.empty:
+            bu_summary_path = base.with_name(f"{base.stem}_bu_summary.csv")
+            bu_summary.to_csv(bu_summary_path, index=False)
+            logger.info(
+                f"  → BU Summary (overall business unit forecast with YoY %) saved to: {bu_summary_path}"
             )
 
         if skipped:

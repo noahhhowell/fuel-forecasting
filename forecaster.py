@@ -1047,72 +1047,18 @@ class FuelForecaster:
         self, forecasts: pd.DataFrame, skipped: List[Dict], output_path: str
     ):
         """Export forecasts to Excel with multiple sheets"""
-        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-            # Main forecasts
-            desired_order = [
-                "site_id",
-                "grade",
-                "target_month",
-                "model",
-                "forecast_volume",
-                "prior_year_month",
-                "prior_year_volume",
-                "yoy_change_pct",
-            ]
-            ordered_cols = [c for c in desired_order if c in forecasts.columns]
+        # Clean column order for the main Forecasts sheet (ENSEMBLE only)
+        clean_cols = [
+            "site_id",
+            "grade",
+            "target_month",
+            "forecast_volume",
+            "prior_year_volume",
+            "yoy_change_pct",
+        ]
 
-            remaining_cols = [
-                c for c in forecasts.columns if c not in ordered_cols
-            ]
-            export_cols = ordered_cols + remaining_cols
-
-            forecasts[export_cols].to_excel(
-                writer, sheet_name="Forecasts", index=False
-            )
-
-            # Site Summary (reconciled site totals from summing grades)
-            site_summary = self._create_site_summary(forecasts)
-            if not site_summary.empty:
-                site_summary.to_excel(writer, sheet_name="Site Summary", index=False)
-                logger.info(
-                    f"  → Site Summary: {len(site_summary)} reconciled site-level forecasts"
-                )
-
-            # Product Summary (grade-level aggregation with YoY %)
-            product_summary = self._create_product_summary(forecasts)
-            if not product_summary.empty:
-                product_summary.to_excel(writer, sheet_name="Product Summary", index=False)
-                logger.info(
-                    f"  → Product Summary: {len(product_summary)} product-level forecasts with YoY %"
-                )
-
-            # BU Summary (overall business unit totals with YoY %)
-            bu_summary = self._create_bu_summary(forecasts)
-            if not bu_summary.empty:
-                bu_summary.to_excel(writer, sheet_name="BU Summary", index=False)
-                logger.info(
-                    f"  → BU Summary: Overall business unit forecast with YoY %"
-                )
-
-            # Skipped items (if any)
-            if skipped:
-                skipped_df = pd.DataFrame(skipped)
-                skipped_df.to_excel(writer, sheet_name="Skipped", index=False)
-
-            # Summary by model
-            summary = (
-                forecasts.groupby("model")["forecast_volume"]
-                .agg(["count", "sum", "mean", "min", "max"])
-                .reset_index()
-            )
-            summary.columns = ["Model", "Count", "Total", "Average", "Min", "Max"]
-            summary.to_excel(writer, sheet_name="Summary", index=False)
-
-    def _export_to_csv(
-        self, forecasts: pd.DataFrame, skipped: List[Dict], output_path: str
-    ):
-        """Export forecasts to CSV; skipped/summary/site_summary go to sibling files"""
-        desired_order = [
+        # Full column order for the Model Detail sheet (all models + diagnostics)
+        detail_order = [
             "site_id",
             "grade",
             "target_month",
@@ -1122,53 +1068,110 @@ class FuelForecaster:
             "prior_year_volume",
             "yoy_change_pct",
         ]
-        ordered_cols = [c for c in desired_order if c in forecasts.columns]
-        remaining_cols = [c for c in forecasts.columns if c not in ordered_cols]
-        export_cols = ordered_cols + remaining_cols
 
-        forecasts[export_cols].to_csv(output_path, index=False)
+        has_grade_detail = "grade" in forecasts.columns and (forecasts["grade"] != "ALL").any()
+
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            # Main Forecasts sheet: ENSEMBLE only, clean columns
+            ensemble = forecasts[forecasts["model"] == "ENSEMBLE"].copy()
+            if ensemble.empty:
+                ensemble = forecasts.copy()
+            ensemble_cols = [c for c in clean_cols if c in ensemble.columns]
+            ensemble[ensemble_cols].to_excel(
+                writer, sheet_name="Forecasts", index=False
+            )
+
+            # BU Total: one-row grand total with YoY
+            bu_summary = self._create_bu_summary(forecasts)
+            if not bu_summary.empty:
+                bu_summary.to_excel(writer, sheet_name="BU Total", index=False)
+
+            # Site Summary: only for site_grade (reconciled site totals from summing grades)
+            if has_grade_detail:
+                site_summary = self._create_site_summary(forecasts)
+                if not site_summary.empty:
+                    site_summary.to_excel(writer, sheet_name="Site Summary", index=False)
+
+                # Product Summary: only for site_grade (grade-level aggregation with YoY)
+                product_summary = self._create_product_summary(forecasts)
+                if not product_summary.empty:
+                    product_summary.to_excel(writer, sheet_name="Product Summary", index=False)
+
+            # Model Detail: all models with full diagnostic columns
+            detail_cols = [c for c in detail_order if c in forecasts.columns]
+            remaining_cols = [c for c in forecasts.columns if c not in detail_cols]
+            forecasts[detail_cols + remaining_cols].to_excel(
+                writer, sheet_name="Model Detail", index=False
+            )
+
+            # Skipped items (if any)
+            if skipped:
+                skipped_df = pd.DataFrame(skipped)
+                skipped_df.to_excel(writer, sheet_name="Skipped", index=False)
+
+    def _export_to_csv(
+        self, forecasts: pd.DataFrame, skipped: List[Dict], output_path: str
+    ):
+        """Export forecasts to CSV; companion files go alongside main file"""
+        # Main file: ENSEMBLE only, clean columns
+        clean_cols = [
+            "site_id",
+            "grade",
+            "target_month",
+            "forecast_volume",
+            "prior_year_volume",
+            "yoy_change_pct",
+        ]
+
+        ensemble = forecasts[forecasts["model"] == "ENSEMBLE"].copy()
+        if ensemble.empty:
+            ensemble = forecasts.copy()
+        ensemble_cols = [c for c in clean_cols if c in ensemble.columns]
+        ensemble[ensemble_cols].to_csv(output_path, index=False)
 
         base = Path(output_path)
+        has_grade_detail = "grade" in forecasts.columns and (forecasts["grade"] != "ALL").any()
 
-        # Site Summary (reconciled site totals from summing grades)
-        site_summary = self._create_site_summary(forecasts)
-        if not site_summary.empty:
-            site_summary_path = base.with_name(f"{base.stem}_site_summary.csv")
-            site_summary.to_csv(site_summary_path, index=False)
-            logger.info(
-                f"  → Site Summary ({len(site_summary)} reconciled forecasts) saved to: {site_summary_path}"
-            )
-
-        # Product Summary (grade-level aggregation with YoY %)
-        product_summary = self._create_product_summary(forecasts)
-        if not product_summary.empty:
-            product_summary_path = base.with_name(f"{base.stem}_product_summary.csv")
-            product_summary.to_csv(product_summary_path, index=False)
-            logger.info(
-                f"  → Product Summary ({len(product_summary)} product-level forecasts with YoY %) saved to: {product_summary_path}"
-            )
-
-        # BU Summary (overall business unit totals with YoY %)
+        # BU Total
         bu_summary = self._create_bu_summary(forecasts)
         if not bu_summary.empty:
-            bu_summary_path = base.with_name(f"{base.stem}_bu_summary.csv")
-            bu_summary.to_csv(bu_summary_path, index=False)
-            logger.info(
-                f"  → BU Summary (overall business unit forecast with YoY %) saved to: {bu_summary_path}"
-            )
+            bu_path = base.with_name(f"{base.stem}_bu_total.csv")
+            bu_summary.to_csv(bu_path, index=False)
+            logger.info(f"  → BU Total saved to: {bu_path}")
+
+        # Site Summary and Product Summary: only for site_grade
+        if has_grade_detail:
+            site_summary = self._create_site_summary(forecasts)
+            if not site_summary.empty:
+                site_summary_path = base.with_name(f"{base.stem}_site_summary.csv")
+                site_summary.to_csv(site_summary_path, index=False)
+                logger.info(f"  → Site Summary saved to: {site_summary_path}")
+
+            product_summary = self._create_product_summary(forecasts)
+            if not product_summary.empty:
+                product_summary_path = base.with_name(f"{base.stem}_product_summary.csv")
+                product_summary.to_csv(product_summary_path, index=False)
+                logger.info(f"  → Product Summary saved to: {product_summary_path}")
+
+        # Model Detail: all models with full columns
+        detail_order = [
+            "site_id",
+            "grade",
+            "target_month",
+            "model",
+            "forecast_volume",
+            "prior_year_month",
+            "prior_year_volume",
+            "yoy_change_pct",
+        ]
+        detail_cols = [c for c in detail_order if c in forecasts.columns]
+        remaining_cols = [c for c in forecasts.columns if c not in detail_cols]
+        detail_path = base.with_name(f"{base.stem}_model_detail.csv")
+        forecasts[detail_cols + remaining_cols].to_csv(detail_path, index=False)
+        logger.info(f"  → Model Detail saved to: {detail_path}")
 
         if skipped:
             skipped_df = pd.DataFrame(skipped)
             skipped_path = base.with_name(f"{base.stem}_skipped.csv")
             skipped_df.to_csv(skipped_path, index=False)
             logger.info(f"  → Skipped items saved to: {skipped_path}")
-
-        summary = (
-            forecasts.groupby("model")["forecast_volume"]
-            .agg(["count", "sum", "mean", "min", "max"])
-            .reset_index()
-        )
-        summary.columns = ["Model", "Count", "Total", "Average", "Min", "Max"]
-        summary_path = base.with_name(f"{base.stem}_summary.csv")
-        summary.to_csv(summary_path, index=False)
-        logger.info(f"  → Summary saved to: {summary_path}")

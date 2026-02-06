@@ -146,21 +146,21 @@ python cli.py export --output with_estimated.csv --include-estimated
 
 | Sheet | Contents |
 |-------|----------|
-| Forecasts | All model results. Columns: `site_id, grade, target_month, model, forecast_volume, prior_year_month, prior_year_volume, yoy_change_pct, ...` |
-| Site Summary | Site-level totals reconciled from grade sums (only for `--by site_grade`) |
-| Product Summary | Grade-level aggregation with YoY % |
-| BU Summary | Overall business unit total with YoY % |
+| Forecasts | ENSEMBLE results only. Columns: `site_id, grade, target_month, forecast_volume, prior_year_volume, yoy_change_pct` |
+| BU Total | One-row grand total with YoY % |
+| Site Summary | Site totals from summing grades (only for `--by site_grade`) |
+| Product Summary | Grade-level aggregation with YoY % (only for `--by site_grade`) |
+| Model Detail | All models (ets, snaive, ENSEMBLE) with full diagnostic columns |
 | Skipped | Sites skipped due to insufficient data |
-| Summary | Statistics by model (count, total, average, min, max) |
 
 ### CSV (.csv)
 
-Main forecasts go to the file you specify. Additional files are created alongside:
-- `<name>_site_summary.csv`
-- `<name>_product_summary.csv`
-- `<name>_bu_summary.csv`
+Main file has ENSEMBLE results only. Companion files are created alongside:
+- `<name>_bu_total.csv`
+- `<name>_site_summary.csv` (only for `--by site_grade`)
+- `<name>_product_summary.csv` (only for `--by site_grade`)
+- `<name>_model_detail.csv`
 - `<name>_skipped.csv`
-- `<name>_summary.csv`
 
 ## Examples
 

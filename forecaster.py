@@ -350,6 +350,30 @@ class FuelForecaster:
         )
         return fallback
 
+    def _normalize_forecast_result_types(self, forecast_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Normalize optional output columns to stable dtypes.
+
+        This prevents pandas concat warnings when combining many per-site/per-grade
+        DataFrames where some optional columns are all-null in a subset of frames.
+        """
+        df = forecast_df.copy()
+
+        if "snaive_used_fallback" in df.columns:
+            df["snaive_used_fallback"] = df["snaive_used_fallback"].astype("boolean")
+        if "prior_year_volume" in df.columns:
+            df["prior_year_volume"] = pd.to_numeric(
+                df["prior_year_volume"], errors="coerce"
+            ).astype("Float64")
+        if "yoy_change_pct" in df.columns:
+            df["yoy_change_pct"] = pd.to_numeric(
+                df["yoy_change_pct"], errors="coerce"
+            ).astype("Float64")
+        if "note" in df.columns:
+            df["note"] = df["note"].astype("string")
+
+        return df
+
     def check_data_sufficiency(
         self, site_id: Optional[str] = None, grade: Optional[str] = None
     ) -> Dict[str, Any]:
@@ -458,6 +482,9 @@ class FuelForecaster:
             )
             prior_year_month = (target_date - pd.DateOffset(years=1)).strftime("%Y-%m")
 
+        monthly_data_was_provided = monthly_data is not None
+        monthly_data_raw_was_provided = monthly_data_raw is not None
+
         # Use cached data or prepare fresh
         if monthly_data is None:
             # Check data sufficiency (log warning if low, but don't block)
@@ -485,7 +512,13 @@ class FuelForecaster:
         if months_ahead <= 0:
             raise ValueError(f"Target month {target_month} is not in the future")
 
-        months_available = len(monthly_data)
+        # Use raw data for sufficiency/quality when both series represent the same
+        # history window. If caller provided only processed data, stay consistent
+        # with that caller-provided window.
+        if monthly_data_raw_was_provided or not monthly_data_was_provided:
+            months_available = len(monthly_data_raw)
+        else:
+            months_available = len(monthly_data)
         data_quality, quality_note = self._assess_data_quality(months_available)
 
         # Get available models
@@ -618,7 +651,7 @@ class FuelForecaster:
             ensemble_row = pd.DataFrame([ensemble_row_data])
             results_df = pd.concat([results_df, ensemble_row], ignore_index=True)
 
-        return results_df
+        return self._normalize_forecast_result_types(results_df)
 
     def generate_bulk_forecasts(
         self,
@@ -681,7 +714,7 @@ class FuelForecaster:
                     site_monthly_data_raw = self.prepare_monthly_data(
                         site_id=row["site_id"], handle_outliers=False, fill_gaps=False
                     )
-                    months_available = len(site_monthly_data)
+                    months_available = len(site_monthly_data_raw)
 
                     if months_available < self.min_months_data and skip_insufficient:
                         skipped.append(
@@ -734,7 +767,7 @@ class FuelForecaster:
                     combo_monthly_data_raw = self.prepare_monthly_data(
                         site_id=row["site_id"], grade=row["grade"], handle_outliers=False, fill_gaps=False
                     )
-                    months_available = len(combo_monthly_data)
+                    months_available = len(combo_monthly_data_raw)
 
                     if months_available < self.soft_min_months and skip_insufficient:
                         skipped.append(
@@ -779,7 +812,10 @@ class FuelForecaster:
             raise ValueError("No forecasts were successfully generated")
 
         # Combine results
-        combined = pd.concat(all_forecasts, ignore_index=True)
+        valid_forecasts = [df for df in all_forecasts if not df.empty]
+        if not valid_forecasts:
+            raise ValueError("No non-empty forecast outputs were generated")
+        combined = pd.concat(valid_forecasts, ignore_index=True)
 
         # Log summary
         logger.info("\nForecast Summary:")

@@ -32,6 +32,10 @@ def restore_csv(bin_path='fuel_minimal.bin',
     # Read binary data
     with open(bin_path, 'rb') as f:
         n_rows = struct.unpack('<I', f.read(4))[0]
+        if n_rows != num_rows:
+            raise ValueError(
+                f"Row count mismatch: binary has {n_rows:,}, lookup JSON has {num_rows:,}"
+            )
 
         site_deltas = np.frombuffer(f.read(n_rows * 1), dtype=np.int8)
         grade_idxs = np.frombuffer(f.read(n_rows * 1), dtype=np.int8)

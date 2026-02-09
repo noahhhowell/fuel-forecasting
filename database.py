@@ -350,8 +350,9 @@ class FuelDatabase:
             DataFrame with site_id, site, and grade columns
         """
         query = """
-        SELECT DISTINCT site_id, site, grade
+        SELECT site_id, MAX(site) as site, grade
         FROM sales
+        GROUP BY site_id, grade
         ORDER BY site_id, grade
         """
         return pd.read_sql_query(query, self.conn)

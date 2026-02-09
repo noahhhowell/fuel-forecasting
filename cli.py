@@ -262,7 +262,7 @@ Examples:
   Generate forecast:
     python cli.py forecast 2026-01                         # Forecasts by site (default)
     python cli.py forecast 2026-01 --output jan_2026.xlsx  # With Excel export
-    python cli.py forecast 2026-01 --by total              # Total forecast only
+    python cli.py forecast 2026-01 --by grade              # Forecast by fuel grade
     python cli.py forecast 2026-01 --by site_grade         # By site and grade
         """,
     )

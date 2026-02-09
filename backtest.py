@@ -38,11 +38,19 @@ def get_actual_monthly_volume(db, site_id, month_str):
 
 
 def run_backtest(db_path="fuel_sales.db", months=6, output=None, min_months=24):
+    if months < 1:
+        raise ValueError("months must be >= 1")
+    if min_months < 1:
+        raise ValueError("min_months must be >= 1")
+
     db = FuelDatabase(db_path)
     forecaster = FuelForecaster(db, min_months_data=min_months)
 
     # Find the date range in the database
     stats = db.get_summary_stats()
+    if not stats.get("total_records"):
+        db.close()
+        raise RuntimeError("Database is empty. Load data before running backtest.")
     max_date = pd.to_datetime(stats["date_range"].split(" to ")[1])
 
     # Build list of test months (most recent complete months)

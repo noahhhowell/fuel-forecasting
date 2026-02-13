@@ -50,6 +50,13 @@ class ForecastModel(ABC):
         if data["date"].isna().all():
             raise ValueError("All date values are NaN - cannot train model")
 
+        missing_required = data[required_cols].isna().any(axis=1)
+        if missing_required.any():
+            missing_rows = int(missing_required.sum())
+            raise ValueError(
+                f"Input data contains {missing_rows} row(s) with missing required values"
+            )
+
     @abstractmethod
     def fit(self, data: pd.DataFrame):
         """Fit model to training data"""
@@ -95,6 +102,8 @@ class SeasonalNaiveModel(ForecastModel):
         """Generate Seasonal Naive predictions using same-month-last-year values"""
         if not self.is_fitted:
             raise ValueError("Model not fitted")
+        if periods < 1:
+            raise ValueError("periods must be >= 1")
 
         # Safety check: ensure we have training data
         if len(self.train_volumes) == 0:
@@ -163,6 +172,11 @@ class ETSModel(ForecastModel):
 
     def _pick_seasonal_mode(self, y: np.ndarray) -> str:
         """Pick multiplicative vs additive seasonality using CV heuristic"""
+        if np.any(~np.isfinite(y)):
+            return "add"
+        if np.any(y <= 0):
+            logger.debug("ETS: Non-positive values detected, forcing additive seasonality")
+            return "add"
         mean = float(np.mean(y))
         std = float(np.std(y))
         cv = std / mean if mean > 1e-9 else 0.0
@@ -224,6 +238,8 @@ class ETSModel(ForecastModel):
         """Generate ETS predictions"""
         if not self.is_fitted:
             raise ValueError("Model not fitted")
+        if periods < 1:
+            raise ValueError("periods must be >= 1")
 
         forecast = self.model.forecast(steps=periods)
 

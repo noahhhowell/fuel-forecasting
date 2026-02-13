@@ -97,6 +97,7 @@ class FuelDatabase:
 
     def _load_dataframe(self, df: pd.DataFrame, file_path: str) -> dict:
         """Normalize columns, validate, and insert rows with deduplication"""
+        total_rows = len(df)
         df.columns = df.columns.str.strip()
         column_map = self._build_column_mapping(df.columns)
         df = df.rename(columns=column_map)
@@ -106,7 +107,26 @@ class FuelDatabase:
         if missing:
             raise ValueError(f"Missing columns: {missing}")
 
-        df["day"] = pd.to_datetime(df["day"]).dt.strftime("%Y-%m-%d")
+        # Normalize key fields to avoid duplicate keys caused by mixed types/whitespace
+        df["site_id"] = self._normalize_text_column(df["site_id"])
+        df["grade"] = self._normalize_text_column(df["grade"], uppercase=True)
+        df["day"] = pd.to_datetime(df["day"], errors="coerce")
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+
+        required_valid = (
+            df["site_id"].notna()
+            & df["grade"].notna()
+            & df["day"].notna()
+            & df["volume"].notna()
+        )
+        invalid = int((~required_valid).sum())
+        if invalid:
+            logger.warning(f"  Skipping {invalid:,} invalid row(s) with missing required fields")
+        df = df.loc[required_valid].copy()
+        if df.empty:
+            raise ValueError("No valid rows after cleaning required fields")
+
+        df["day"] = df["day"].dt.strftime("%Y-%m-%d")
 
         if "is_estimated" in df.columns:
             df["is_estimated"] = df["is_estimated"].apply(self._normalize_bool)
@@ -150,9 +170,11 @@ class FuelDatabase:
 
         return {
             "file": Path(file_path).name,
-            "total_rows": len(df),
+            "total_rows": total_rows,
+            "valid_rows": len(df),
             "inserted": inserted,
-            "duplicates": duplicates
+            "duplicates": duplicates,
+            "invalid": invalid,
         }
 
     def _build_column_mapping(self, columns) -> dict:
@@ -199,6 +221,16 @@ class FuelDatabase:
         text = str(value).strip().lower()
         return text in {"true", "1", "yes", "y"}
 
+    @staticmethod
+    def _normalize_text_column(series: pd.Series, uppercase: bool = False) -> pd.Series:
+        """Normalize text identifiers and convert blank-like values to NA."""
+        normalized = series.astype("string").str.strip()
+        blank_like = normalized.str.lower().isin({"", "nan", "none", "<na>"})
+        normalized = normalized.mask(blank_like, pd.NA)
+        if uppercase:
+            normalized = normalized.str.upper()
+        return normalized
+
     def _get_count(self) -> int:
         """Get total record count"""
         return self.conn.execute("SELECT COUNT(*) FROM sales").fetchone()[0]
@@ -219,8 +251,10 @@ class FuelDatabase:
                 results.append({
                     "file": Path(file_path).name,
                     "total_rows": 0,
+                    "valid_rows": 0,
                     "inserted": 0,
                     "duplicates": 0,
+                    "invalid": 0,
                     "error": str(e)
                 })
         return pd.DataFrame(results)
@@ -250,7 +284,7 @@ class FuelDatabase:
         params = []
         
         if exclude_estimated:
-            query += " AND is_estimated = 0"
+            query += " AND COALESCE(is_estimated, 0) = 0"
         
         if start_date:
             query += " AND day >= ?"
@@ -284,14 +318,19 @@ class FuelDatabase:
         stats["total_records"] = self._get_count()
         
         stats["non_estimated_records"] = self.conn.execute(
-            "SELECT COUNT(*) FROM sales WHERE is_estimated = 0"
+            "SELECT COUNT(*) FROM sales WHERE COALESCE(is_estimated, 0) = 0"
         ).fetchone()[0]
         
         date_range = pd.read_sql_query(
             "SELECT MIN(day) as min_date, MAX(day) as max_date FROM sales",
             self.conn
         ).iloc[0]
-        stats["date_range"] = f"{date_range['min_date']} to {date_range['max_date']}"
+        min_date = date_range["min_date"]
+        max_date = date_range["max_date"]
+        if pd.isna(min_date) or pd.isna(max_date):
+            stats["date_range"] = "N/A"
+        else:
+            stats["date_range"] = f"{min_date} to {max_date}"
         
         stats["unique_sites"] = self.conn.execute(
             "SELECT COUNT(DISTINCT site_id) FROM sales"
@@ -301,7 +340,11 @@ class FuelDatabase:
             "SELECT DISTINCT grade FROM sales ORDER BY grade",
             self.conn
         )
-        stats["fuel_grades"] = grades["grade"].tolist()
+        stats["fuel_grades"] = [
+            grade
+            for grade in grades["grade"].tolist()
+            if pd.notna(grade) and str(grade).strip() != ""
+        ]
         
         return stats
 
@@ -321,7 +364,7 @@ class FuelDatabase:
             MAX(day) as last_date,
             COUNT(*) as total_records
         FROM sales
-        WHERE is_estimated = 0
+        WHERE COALESCE(is_estimated, 0) = 0
         GROUP BY site_id, site
         ORDER BY months_of_data DESC
         """

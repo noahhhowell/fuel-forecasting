@@ -37,11 +37,13 @@ def get_actual_monthly_volume(db, site_id, month_str):
     return float(df["volume"].sum())
 
 
-def run_backtest(db_path="fuel_sales.db", months=6, output=None, min_months=24):
+def run_backtest(db_path="fuel_sales.db", months=6, output=None, min_months=24, horizon=2):
     if months < 1:
         raise ValueError("months must be >= 1")
     if min_months < 1:
         raise ValueError("min_months must be >= 1")
+    if horizon < 0:
+        raise ValueError("horizon must be >= 0")
 
     db = FuelDatabase(db_path)
     forecaster = FuelForecaster(db, min_months_data=min_months)
@@ -64,7 +66,7 @@ def run_backtest(db_path="fuel_sales.db", months=6, output=None, min_months=24):
 
     # Get sites with enough data
     sites_df = db.get_distinct_sites()
-    print(f"Backtest: {months} months, {len(sites_df)} sites total\n")
+    print(f"Backtest: {months} months, {len(sites_df)} sites total, horizon={horizon} months ahead\n")
     print(f"Test period: {test_months[0].strftime('%Y-%m')} to {test_months[-1].strftime('%Y-%m')}")
     print(f"Checking data sufficiency...\n")
 
@@ -74,11 +76,14 @@ def run_backtest(db_path="fuel_sales.db", months=6, output=None, min_months=24):
     for _, row in sites_df.iterrows():
         site_id = row["site_id"]
         # Check months of data before earliest test month
-        cutoff = (earliest_test - pd.DateOffset(days=1)).strftime("%Y-%m-%d")
-        data = forecaster.prepare_monthly_data(
-            site_id=site_id, end_date=cutoff,
-            handle_outliers=False, fill_gaps=False,
-        )
+        cutoff = (earliest_test - pd.DateOffset(months=horizon, days=1)).strftime("%Y-%m-%d")
+        try:
+            data = forecaster.prepare_monthly_data(
+                site_id=site_id, end_date=cutoff,
+                handle_outliers=False, fill_gaps=False,
+            )
+        except ValueError:
+            continue
         if len(data) >= min_months:
             qualified_sites.append(site_id)
 
@@ -86,7 +91,7 @@ def run_backtest(db_path="fuel_sales.db", months=6, output=None, min_months=24):
     if not qualified_sites:
         print("No sites have enough data for backtesting.")
         db.close()
-        return
+        return None, None
 
     # Run forecasts for each site x test month
     results = []
@@ -106,8 +111,9 @@ def run_backtest(db_path="fuel_sales.db", months=6, output=None, min_months=24):
             if actual is None or actual <= 0:
                 continue
 
-            # Cutoff: last day of the month before the test month
-            cutoff = (test_month - pd.DateOffset(days=1)).strftime("%Y-%m-%d")
+            # Cutoff: simulate real-world data availability at forecast submission
+            # horizon=2 means forecasting 2 months ahead, so data through (target - horizon - 1) month
+            cutoff = (test_month - pd.DateOffset(months=horizon, days=1)).strftime("%Y-%m-%d")
 
             try:
                 monthly_data = forecaster.prepare_monthly_data(
@@ -119,7 +125,7 @@ def run_backtest(db_path="fuel_sales.db", months=6, output=None, min_months=24):
                     handle_outliers=False, fill_gaps=False,
                 )
 
-                if len(monthly_data) < 12:
+                if len(monthly_data) < min_months:
                     continue
 
                 forecast_df = forecaster.generate_forecast(
@@ -154,7 +160,7 @@ def run_backtest(db_path="fuel_sales.db", months=6, output=None, min_months=24):
     if not results:
         print("No results generated. Check that test months have actual data.")
         db.close()
-        return
+        return None, None
 
     results_df = pd.DataFrame(results)
 
@@ -183,9 +189,9 @@ def run_backtest(db_path="fuel_sales.db", months=6, output=None, min_months=24):
 
     print(f"Backtest: {months} months, {total_sites} sites\n")
     print(f"Overall MAPE: {overall_mape:.1f}%\n")
-    print(f"  MAPE < 5%:  {good:>4} sites ({good*100//total_sites}%) - Good")
-    print(f"  MAPE 5-10%: {acceptable:>4} sites ({acceptable*100//total_sites}%) - Acceptable")
-    print(f"  MAPE > 10%: {review:>4} sites ({review*100//total_sites}%) - Review these")
+    print(f"  MAPE < 5%:  {good:>4} sites ({round(good*100/total_sites)}%) - Good")
+    print(f"  MAPE 5-10%: {acceptable:>4} sites ({round(acceptable*100/total_sites)}%) - Acceptable")
+    print(f"  MAPE > 10%: {review:>4} sites ({round(review*100/total_sites)}%) - Review these")
 
     # Save to Excel if requested
     if output:
@@ -218,6 +224,10 @@ def main():
         "--min-months", type=int, default=24,
         help="Minimum months of pre-test data required (default: 24)",
     )
+    parser.add_argument(
+        "--horizon", type=int, default=2,
+        help="Forecast horizon in months ahead (default: 2, e.g. Feb submission for April target)",
+    )
     args = parser.parse_args()
 
     run_backtest(
@@ -225,6 +235,7 @@ def main():
         months=args.months,
         output=args.output,
         min_months=args.min_months,
+        horizon=args.horizon,
     )
 
 

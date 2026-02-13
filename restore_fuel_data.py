@@ -12,7 +12,6 @@ import json
 import struct
 import numpy as np
 import pandas as pd
-from pathlib import Path
 
 def restore_csv(bin_path='fuel_minimal.bin',
                 json_path='fuel_lookups_min.json',
@@ -46,6 +45,23 @@ def restore_csv(bin_path='fuel_minimal.bin',
         targets = np.frombuffer(f.read(n_rows * 2), dtype=np.float16)
         created_idxs = np.frombuffer(f.read(n_rows * 1), dtype=np.uint8)
 
+    arrays = {
+        'site_deltas': site_deltas,
+        'grade_idxs': grade_idxs,
+        'day_deltas': day_deltas,
+        'volumes': volumes,
+        'is_estimated': is_estimated,
+        'total_sales': total_sales,
+        'targets': targets,
+        'created_idxs': created_idxs,
+    }
+    for name, values in arrays.items():
+        if len(values) != n_rows:
+            raise ValueError(
+                f"Binary payload is truncated for {name}: "
+                f"expected {n_rows:,} values, got {len(values):,}"
+            )
+
     # Reconstruct indices from deltas
     site_idxs = np.cumsum(site_deltas.astype(np.int32))
     day_idxs = np.cumsum(day_deltas.astype(np.int32))
@@ -53,13 +69,23 @@ def restore_csv(bin_path='fuel_minimal.bin',
     # Build dataframe
     rows = []
     for i in range(n_rows):
-        site_idx = site_idxs[i]
+        site_idx = int(site_idxs[i])
+        grade_idx = int(grade_idxs[i])
+        day_idx = int(day_idxs[i])
+
+        if site_idx < 0 or site_idx >= len(sites):
+            raise ValueError(f"Invalid site index at row {i:,}: {site_idx}")
+        if grade_idx < 0 or grade_idx >= len(grades):
+            raise ValueError(f"Invalid grade index at row {i:,}: {grade_idx}")
+        if day_idx < 0 or day_idx >= len(days):
+            raise ValueError(f"Invalid day index at row {i:,}: {day_idx}")
+
         site_data = sites[site_idx]
 
         row = {
             'site_id': site_data['site_id'],
-            'grade': grades[grade_idxs[i]],
-            'day': days[day_idxs[i]],
+            'grade': grades[grade_idx],
+            'day': days[day_idx],
             'brand': site_data['brand'],
             'site': site_data['site'],
             'address': site_data['address'],

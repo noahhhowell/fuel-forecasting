@@ -31,9 +31,11 @@ def load_command(args):
                 stats = db.load_from_csv(args.file)
             else:
                 stats = db.load_from_excel(args.file)
-            print(f"\n✓ Loaded: {stats['file']}")
-            print(f"  • Inserted: {stats['inserted']:,} records")
-            print(f"  • Duplicates skipped: {stats['duplicates']:,}")
+            print(f"\n[ok] Loaded: {stats['file']}")
+            print(f"  - Inserted: {stats['inserted']:,} records")
+            print(f"  - Duplicates skipped: {stats['duplicates']:,}")
+            if stats.get("invalid", 0):
+                print(f"  - Invalid rows skipped: {stats['invalid']:,}")
 
         elif args.directory:
             # All Excel files in directory
@@ -45,18 +47,23 @@ def load_command(args):
             )
 
             if not excel_files:
-                print(f"\n✗ No Excel/CSV files found in {directory}")
+                print(f"\n[x] No Excel/CSV files found in {directory}")
                 return
 
             print(f"\nFound {len(excel_files)} Excel/CSV files\n")
             results = db.load_multiple_files([str(f) for f in excel_files])
 
             print("\nLoad Summary:")
-            print(results[["file", "inserted", "duplicates"]].to_string(index=False))
+            summary_cols = ["file", "inserted", "duplicates"]
+            if "invalid" in results.columns:
+                summary_cols.append("invalid")
+            print(results[summary_cols].to_string(index=False))
             print(f"\nTotal inserted: {results['inserted'].sum():,}")
             print(f"Total duplicates: {results['duplicates'].sum():,}")
+            if "invalid" in results.columns:
+                print(f"Total invalid skipped: {int(results['invalid'].fillna(0).sum()):,}")
 
-        print("\n✓ Complete!")
+        print("\n[ok] Complete!")
 
     finally:
         db.close()
@@ -74,11 +81,12 @@ def status_command(args):
         # Summary stats
         stats = db.get_summary_stats()
         print("\nRecords:")
-        print(f"  • Total: {stats['total_records']:,}")
-        print(f"  • Non-estimated: {stats['non_estimated_records']:,}")
+        print(f"  - Total: {stats['total_records']:,}")
+        print(f"  - Non-estimated: {stats['non_estimated_records']:,}")
         print(f"\nDate Range: {stats['date_range']}")
         print(f"Unique Sites: {stats['unique_sites']}")
-        print(f"Fuel Grades: {', '.join(stats['fuel_grades'])}")
+        fuel_grades = [str(g) for g in stats.get("fuel_grades", []) if g is not None]
+        print(f"Fuel Grades: {', '.join(fuel_grades) if fuel_grades else 'N/A'}")
 
         # Data quality check
         if args.detailed:
@@ -100,13 +108,13 @@ def status_command(args):
             # Show summary
             print("\nData Quality Summary:")
             print(
-                f"  • Sites with 24+ months: {len(quality[quality['months_of_data'] >= 24])}"
+                f"  - Sites with 24+ months: {len(quality[quality['months_of_data'] >= 24])}"
             )
             print(
-                f"  • Sites with 12-23 months: {len(quality[(quality['months_of_data'] >= 12) & (quality['months_of_data'] < 24)])}"
+                f"  - Sites with 12-23 months: {len(quality[(quality['months_of_data'] >= 12) & (quality['months_of_data'] < 24)])}"
             )
             print(
-                f"  • Sites with <12 months: {len(quality[quality['months_of_data'] < 12])}"
+                f"  - Sites with <12 months: {len(quality[quality['months_of_data'] < 12])}"
             )
 
     finally:
@@ -125,17 +133,17 @@ def export_command(args):
         # Get filtered data
         print("\nFilters:")
         if args.start_date:
-            print(f"  • Start date: {args.start_date}")
+            print(f"  - Start date: {args.start_date}")
         if args.end_date:
-            print(f"  • End date: {args.end_date}")
+            print(f"  - End date: {args.end_date}")
         if args.site_id:
-            print(f"  • Site ID: {args.site_id}")
+            print(f"  - Site ID: {args.site_id}")
         if args.grade:
-            print(f"  • Grade: {args.grade}")
+            print(f"  - Grade: {args.grade}")
         if args.include_estimated:
-            print(f"  • Including estimated values: Yes")
+            print("  - Including estimated values: Yes")
         else:
-            print(f"  • Excluding estimated values (default)")
+            print("  - Excluding estimated values (default)")
 
         print("\nQuerying database...")
 
@@ -152,7 +160,7 @@ def export_command(args):
         )
 
         if data.empty:
-            print("\n✗ No data found matching the specified filters")
+            print("\n[x] No data found matching the specified filters")
             return
 
         # Export to CSV
@@ -160,15 +168,15 @@ def export_command(args):
         data.to_csv(output_file, index=False)
 
         # Show summary
-        print(f"\n✓ Exported {len(data):,} records to: {output_file}")
+        print(f"\n[ok] Exported {len(data):,} records to: {output_file}")
         print(f"\nData Summary:")
-        print(f"  • Date range: {data['day'].min()} to {data['day'].max()}")
-        print(f"  • Unique sites: {data['site_id'].nunique()}")
-        print(f"  • Unique grades: {data['grade'].nunique()}")
-        print(f"  • File size: ~{len(data) * 50 / 1024 / 1024:.1f} MB (estimated)")
+        print(f"  - Date range: {data['day'].min()} to {data['day'].max()}")
+        print(f"  - Unique sites: {data['site_id'].nunique()}")
+        print(f"  - Unique grades: {data['grade'].nunique()}")
+        print(f"  - File size: ~{len(data) * 50 / 1024 / 1024:.1f} MB (estimated)")
 
     except Exception as e:
-        print(f"\n✗ Error: {e}")
+        print(f"\n[x] Error: {e}")
         sys.exit(1)
 
     finally:
@@ -228,10 +236,10 @@ def forecast_command(args):
                     )
 
         if args.output:
-            print(f"\n✓ Exported to: {args.output}")
+            print(f"\n[ok] Exported to: {args.output}")
 
     except Exception as e:
-        print(f"\n✗ Error: {e}")
+        print(f"\n[x] Error: {e}")
         sys.exit(1)
 
     finally:
@@ -365,7 +373,7 @@ Examples:
         print("\n\nInterrupted by user")
         sys.exit(1)
     except Exception as e:
-        print(f"\n✗ Unexpected error: {e}")
+        print(f"\n[x] Unexpected error: {e}")
         import traceback
 
         traceback.print_exc()

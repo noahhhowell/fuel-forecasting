@@ -58,6 +58,11 @@ class FuelForecaster:
         Returns:
             DataFrame with monthly volume data
         """
+        if isinstance(site_id, str) and site_id.strip() == "":
+            site_id = None
+        if isinstance(grade, str) and grade.strip() == "":
+            grade = None
+
         site_ids = [site_id] if site_id else None
         grades = [grade] if grade else None
 
@@ -130,6 +135,18 @@ class FuelForecaster:
         reindexed = reindexed.reset_index().rename(columns={"index": "date"})
         return reindexed
 
+    @staticmethod
+    def _count_trailing_true(mask) -> int:
+        """Count consecutive True values from the end of a boolean array/Series."""
+        count = 0
+        values = mask if isinstance(mask, np.ndarray) else mask.values
+        for val in reversed(values):
+            if val:
+                count += 1
+            else:
+                break
+        return count
+
     def _handle_outliers(
         self, data: pd.DataFrame, site_id: Optional[str] = None
     ) -> pd.DataFrame:
@@ -140,9 +157,14 @@ class FuelForecaster:
         to legitimate business changes (growth, new customers, etc.) while still
         catching true data errors (typos, system glitches).
 
+        Sustained level shifts (3+ consecutive trailing months all outside bounds)
+        are detected and protected from clipping, as they represent real business
+        changes like high-speed diesel upgrades or new store ramp-ups.
+
         Outliers are capped at boundaries rather than removed to preserve time series continuity.
         """
         df = data.copy()
+        site_label = f"Site {site_id}" if site_id else "Dataset"
 
         # Use rolling window for statistics (adapts to business changes)
         # 18 months captures seasonality while being responsive to trends
@@ -158,13 +180,25 @@ class FuelForecaster:
             # More permissive: 8x rolling median instead of 5x
             spike_cap = rolling_median * 8
             spike_mask = df["volume"] > spike_cap.fillna(df["volume"].max() * 2)
+
+            if spike_mask.any():
+                # Protect sustained trailing level shifts: 3+ consecutive months
+                # above the spike cap indicate a real business change, not data errors
+                trailing = self._count_trailing_true(spike_mask)
+                if trailing >= 3:
+                    spike_mask.iloc[-trailing:] = False
+                    logger.info(
+                        f"  {site_label}: Step-change detected - preserving "
+                        f"trailing {trailing} month(s) from spike cap"
+                    )
+
             if spike_mask.any():
                 capped = int(spike_mask.sum())
                 df.loc[spike_mask, "volume"] = spike_cap[spike_mask].fillna(
                     df["volume"].median()
                 )
                 logger.info(
-                    f"  {site_id or 'Dataset'}: Capped {capped} spike(s) at 8x rolling median"
+                    f"  {site_label}: Capped {capped} spike(s) at 8x rolling median"
                 )
 
         # Recompute recent volumes after spike capping so MAD uses cleaned data
@@ -190,18 +224,32 @@ class FuelForecaster:
         # Identify outliers
         volumes = df["volume"].values
         outlier_mask = (volumes < lower_bound) | (volumes > upper_bound)
+
+        # Protect sustained trailing level shifts: 3+ consecutive months outside
+        # bounds indicate a real business change (e.g., high-speed diesel upgrade,
+        # new store ramp-up), not data errors
+        trailing = self._count_trailing_true(outlier_mask)
+        if trailing >= 3:
+            outlier_mask[-trailing:] = False
+            logger.info(
+                f"  {site_label}: Step-change detected - preserving "
+                f"trailing {trailing} month(s) from MAD bounds "
+                f"[{lower_bound:.0f}, {upper_bound:.0f}]"
+            )
+
         outlier_indices = df.index[outlier_mask]
         outlier_count = len(outlier_indices)
 
         if outlier_count > 0:
-            # Clip outliers at boundaries (preserves time series structure)
-            df["volume"] = df["volume"].clip(lower=lower_bound, upper=upper_bound)
+            # Clip only flagged outliers, not step-change protected months
+            df.loc[outlier_indices, "volume"] = df.loc[
+                outlier_indices, "volume"
+            ].clip(lower=lower_bound, upper=upper_bound)
 
             # Log details for audit trail
             outlier_dates = (
                 df.loc[outlier_indices, "date"].dt.strftime("%Y-%m").tolist()
             )
-            site_label = f"Site {site_id}" if site_id else "Dataset"
             logger.info(
                 f"  {site_label}: Capped {outlier_count} outlier(s) at boundaries "
                 f"[{lower_bound:.0f}, {upper_bound:.0f}] in months: {outlier_dates[:5]}"
@@ -440,7 +488,7 @@ class FuelForecaster:
                 trained_models[model_name] = model
                 logger.debug(f"Trained model {model_name}")
             except Exception as e:
-                logger.warning(f"✗ {model_name}: {e}")
+                logger.warning(f"[x] {model_name}: {e}")
 
         self.models = trained_models
         return trained_models
@@ -470,6 +518,11 @@ class FuelForecaster:
         Returns:
             DataFrame with forecasts from all models
         """
+        if isinstance(site_id, str) and site_id.strip() == "":
+            site_id = None
+        if isinstance(grade, str) and grade.strip() == "":
+            grade = None
+
         # Normalize target month to first day of month
         target_date = pd.to_datetime(target_month).to_period("M").to_timestamp()
 
@@ -681,7 +734,20 @@ class FuelForecaster:
 
         if by == "grade":
             stats = self.db.get_summary_stats()
-            grades = stats["fuel_grades"]
+            raw_grades = stats.get("fuel_grades", [])
+            grades = []
+            seen = set()
+            for grade in raw_grades:
+                if pd.isna(grade):
+                    continue
+                grade_value = str(grade).strip()
+                if not grade_value or grade_value in seen:
+                    continue
+                seen.add(grade_value)
+                grades.append(grade_value)
+
+            if not grades:
+                raise ValueError("No valid fuel grades found in database")
 
             logger.info(f"Generating forecasts for {len(grades)} grades")
 
@@ -693,7 +759,7 @@ class FuelForecaster:
                     )
                     all_forecasts.append(forecast)
                 except Exception as e:
-                    logger.warning(f"  ✗ Failed: {e}")
+                    logger.warning(f"  [x] Failed: {e}")
                     skipped.append({"grade": grade, "reason": str(e)})
 
         elif by == "site":
@@ -738,7 +804,7 @@ class FuelForecaster:
                     all_forecasts.append(forecast)
 
                 except Exception as e:
-                    logger.warning(f"  ✗ Site {row['site_id']}: {e}")
+                    logger.warning(f"  [x] Site {row['site_id']}: {e}")
                     skipped.append(
                         {
                             "site_id": row["site_id"],
@@ -794,7 +860,7 @@ class FuelForecaster:
 
                 except Exception as e:
                     logger.warning(
-                        f"  ✗ Site {row['site_id']}, Grade {row['grade']}: {e}"
+                        f"  [x] Site {row['site_id']}, Grade {row['grade']}: {e}"
                     )
                     skipped.append(
                         {
@@ -819,9 +885,9 @@ class FuelForecaster:
 
         # Log summary
         logger.info("\nForecast Summary:")
-        logger.info(f"  ✓ Generated: {len(all_forecasts)} forecasts")
+        logger.info(f"  [ok] Generated: {len(all_forecasts)} forecasts")
         if skipped:
-            logger.info(f"  ⊘ Skipped: {len(skipped)} items")
+            logger.info(f"  [skip] Skipped: {len(skipped)} items")
 
         # Export to Excel
         if output_path:
@@ -838,7 +904,7 @@ class FuelForecaster:
             self._export_to_csv(forecasts, skipped, output_path)
         else:
             self._export_to_excel(forecasts, skipped, output_path)
-        logger.info(f"  → Saved to: {output_path}")
+        logger.info(f"  -> Saved to: {output_path}")
 
     def _create_site_summary(self, forecasts: pd.DataFrame) -> pd.DataFrame:
         """
@@ -861,8 +927,17 @@ class FuelForecaster:
         if not has_grade_detail:
             return pd.DataFrame()
 
-        # Filter to only rows with actual grade values (not ALL)
-        grade_data = forecasts[forecasts["grade"] != "ALL"].copy()
+        # Filter to ENSEMBLE model for clean aggregation (avoid double-counting),
+        # consistent with _create_product_summary and _create_bu_summary
+        if "model" in forecasts.columns:
+            grade_data = forecasts[
+                (forecasts["grade"] != "ALL") & (forecasts["model"] == "ENSEMBLE")
+            ].copy()
+            if grade_data.empty:
+                # Fallback to all non-ALL grade data if no ENSEMBLE
+                grade_data = forecasts[forecasts["grade"] != "ALL"].copy()
+        else:
+            grade_data = forecasts[forecasts["grade"] != "ALL"].copy()
 
         if grade_data.empty:
             return pd.DataFrame()
@@ -872,8 +947,8 @@ class FuelForecaster:
         if "prior_year_volume" in grade_data.columns:
             sum_cols.append("prior_year_volume")
 
-        # Group by site and model, sum the volumes
-        group_cols = ["site_id", "target_month", "model"]
+        # Group by site, sum the volumes across grades
+        group_cols = ["site_id", "target_month"]
 
         # Build aggregation dict
         agg_dict = {col: "sum" for col in sum_cols if col in grade_data.columns}
@@ -895,7 +970,6 @@ class FuelForecaster:
         desired_order = [
             "site_id",
             "target_month",
-            "model",
             "forecast_volume",
             "prior_year_volume",
             "yoy_change_pct",
@@ -1079,6 +1153,92 @@ class FuelForecaster:
 
         return bu_summary
 
+    def _load_truck_stop_ids(self) -> List[str]:
+        """Load truck stop site IDs from truck_stop_key.xlsx"""
+        key_path = Path(__file__).parent / "truck_stop_key.xlsx"
+        if not key_path.exists():
+            logger.warning(f"Truck stop key not found: {key_path}")
+            return []
+        truck_df = pd.read_excel(key_path)
+        truck_df.columns = truck_df.columns.astype(str).str.strip()
+        site_col = next(
+            (col for col in truck_df.columns if col.lower() in {"site", "site_id", "siteid"}),
+            None,
+        )
+        if site_col is None:
+            logger.warning(f"Truck stop key missing site column: {key_path}")
+            return []
+
+        truck_ids = truck_df[site_col].dropna().astype(str).str.strip()
+        truck_ids = truck_ids[truck_ids != ""]
+        return sorted(truck_ids.unique().tolist())
+
+    def _create_truck_stop_sheet(self, forecasts: pd.DataFrame) -> pd.DataFrame:
+        """
+        Create Truck Stops sheet: truck stop site IDs with their DSL forecast volume.
+
+        Only populated when forecasts contain grade-level detail (--by site_grade).
+        """
+        has_grade_detail = "grade" in forecasts.columns and (forecasts["grade"] != "ALL").any()
+        if not has_grade_detail:
+            return pd.DataFrame()
+
+        truck_ids = self._load_truck_stop_ids()
+        if not truck_ids:
+            return pd.DataFrame()
+
+        required = {"site_id", "model", "grade", "forecast_volume"}
+        if not required.issubset(forecasts.columns):
+            return pd.DataFrame()
+
+        normalized = forecasts.copy()
+        normalized["site_id"] = normalized["site_id"].astype(str).str.strip()
+
+        # Filter to ENSEMBLE DSL forecasts for truck stop sites
+        mask = (
+            (normalized["model"] == "ENSEMBLE")
+            & (normalized["grade"] == "DSL")
+            & (normalized["site_id"].isin(truck_ids))
+        )
+        truck_forecasts = normalized.loc[mask, ["site_id", "forecast_volume"]].copy()
+        if not truck_forecasts.empty:
+            truck_forecasts = (
+                truck_forecasts.groupby("site_id", as_index=False)["forecast_volume"].sum()
+            )
+
+        # Ensure all truck stop sites appear (even if no DSL forecast was generated)
+        all_truck = pd.DataFrame({"site_id": truck_ids})
+        truck_forecasts = all_truck.merge(truck_forecasts, on="site_id", how="left")
+
+        return truck_forecasts
+
+    @staticmethod
+    def _format_worksheet(ws):
+        """Apply number formatting to a worksheet based on column headers."""
+        from openpyxl.utils import get_column_letter
+
+        # Map column names to Excel number formats
+        formats = {
+            "forecast_volume": "#,##0",
+            "prior_year_volume": "#,##0",
+            "yoy_change_pct": "0.0",
+            "sites_included": "#,##0",
+            "grades_included": "#,##0",
+            "months_available": "#,##0",
+        }
+
+        # Read header row to find which columns need formatting
+        header_map = {}
+        for col_idx, cell in enumerate(ws[1], start=1):
+            if cell.value in formats:
+                header_map[col_idx] = formats[cell.value]
+
+        # Apply formats to data rows
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            for cell in row:
+                if cell.column in header_map:
+                    cell.number_format = header_map[cell.column]
+
     def _export_to_excel(
         self, forecasts: pd.DataFrame, skipped: List[Dict], output_path: str
     ):
@@ -1108,7 +1268,25 @@ class FuelForecaster:
         has_grade_detail = "grade" in forecasts.columns and (forecasts["grade"] != "ALL").any()
 
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-            # Main Forecasts sheet: ENSEMBLE only, clean columns
+            # Sheet order: BU Total -> Product Summary -> Site Summary ->
+            #              Forecasts -> Truck Stops -> Model Detail -> Skipped
+
+            # BU Total: one-row grand total with YoY
+            bu_summary = self._create_bu_summary(forecasts)
+            if not bu_summary.empty:
+                bu_summary.to_excel(writer, sheet_name="BU Total", index=False)
+
+            # Product Summary & Site Summary: only for site_grade
+            if has_grade_detail:
+                product_summary = self._create_product_summary(forecasts)
+                if not product_summary.empty:
+                    product_summary.to_excel(writer, sheet_name="Product Summary", index=False)
+
+                site_summary = self._create_site_summary(forecasts)
+                if not site_summary.empty:
+                    site_summary.to_excel(writer, sheet_name="Site Summary", index=False)
+
+            # Forecasts: ENSEMBLE only, clean columns
             ensemble = forecasts[forecasts["model"] == "ENSEMBLE"].copy()
             if ensemble.empty:
                 ensemble = forecasts.copy()
@@ -1117,21 +1295,12 @@ class FuelForecaster:
                 writer, sheet_name="Forecasts", index=False
             )
 
-            # BU Total: one-row grand total with YoY
-            bu_summary = self._create_bu_summary(forecasts)
-            if not bu_summary.empty:
-                bu_summary.to_excel(writer, sheet_name="BU Total", index=False)
-
-            # Site Summary: only for site_grade (reconciled site totals from summing grades)
-            if has_grade_detail:
-                site_summary = self._create_site_summary(forecasts)
-                if not site_summary.empty:
-                    site_summary.to_excel(writer, sheet_name="Site Summary", index=False)
-
-                # Product Summary: only for site_grade (grade-level aggregation with YoY)
-                product_summary = self._create_product_summary(forecasts)
-                if not product_summary.empty:
-                    product_summary.to_excel(writer, sheet_name="Product Summary", index=False)
+            # Truck Stops: DSL forecasts for truck stop sites
+            truck_stops = self._create_truck_stop_sheet(forecasts)
+            if not truck_stops.empty:
+                truck_stops.to_excel(
+                    writer, sheet_name="Truck Stops", index=False
+                )
 
             # Model Detail: all models with full diagnostic columns
             detail_cols = [c for c in detail_order if c in forecasts.columns]
@@ -1144,6 +1313,10 @@ class FuelForecaster:
             if skipped:
                 skipped_df = pd.DataFrame(skipped)
                 skipped_df.to_excel(writer, sheet_name="Skipped", index=False)
+
+            # Apply number formatting to all sheets
+            for ws in writer.book.worksheets:
+                self._format_worksheet(ws)
 
     def _export_to_csv(
         self, forecasts: pd.DataFrame, skipped: List[Dict], output_path: str
@@ -1173,7 +1346,7 @@ class FuelForecaster:
         if not bu_summary.empty:
             bu_path = base.with_name(f"{base.stem}_bu_total.csv")
             bu_summary.to_csv(bu_path, index=False)
-            logger.info(f"  → BU Total saved to: {bu_path}")
+            logger.info(f"  -> BU Total saved to: {bu_path}")
 
         # Site Summary and Product Summary: only for site_grade
         if has_grade_detail:
@@ -1181,13 +1354,13 @@ class FuelForecaster:
             if not site_summary.empty:
                 site_summary_path = base.with_name(f"{base.stem}_site_summary.csv")
                 site_summary.to_csv(site_summary_path, index=False)
-                logger.info(f"  → Site Summary saved to: {site_summary_path}")
+                logger.info(f"  -> Site Summary saved to: {site_summary_path}")
 
             product_summary = self._create_product_summary(forecasts)
             if not product_summary.empty:
                 product_summary_path = base.with_name(f"{base.stem}_product_summary.csv")
                 product_summary.to_csv(product_summary_path, index=False)
-                logger.info(f"  → Product Summary saved to: {product_summary_path}")
+                logger.info(f"  -> Product Summary saved to: {product_summary_path}")
 
         # Model Detail: all models with full columns
         detail_order = [
@@ -1204,10 +1377,10 @@ class FuelForecaster:
         remaining_cols = [c for c in forecasts.columns if c not in detail_cols]
         detail_path = base.with_name(f"{base.stem}_model_detail.csv")
         forecasts[detail_cols + remaining_cols].to_csv(detail_path, index=False)
-        logger.info(f"  → Model Detail saved to: {detail_path}")
+        logger.info(f"  -> Model Detail saved to: {detail_path}")
 
         if skipped:
             skipped_df = pd.DataFrame(skipped)
             skipped_path = base.with_name(f"{base.stem}_skipped.csv")
             skipped_df.to_csv(skipped_path, index=False)
-            logger.info(f"  → Skipped items saved to: {skipped_path}")
+            logger.info(f"  -> Skipped items saved to: {skipped_path}")

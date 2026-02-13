@@ -215,9 +215,30 @@ python backtest.py
 
 # Test against last 12 months, save results to Excel
 python backtest.py --months 12 --output backtest_results.xlsx
+
+# Custom horizon (e.g., 3 months ahead)
+python backtest.py --horizon 3
 ```
 
 Holds out recent months, generates forecasts using only prior data, and reports MAPE (Mean Absolute Percentage Error) per site.
+
+## Running Tests
+
+```bash
+# Run the full test suite (53 tests, ~10 seconds)
+uv run pytest
+
+# Verbose output (see every test name)
+uv run pytest tests/ -v
+
+# Run just one file
+uv run pytest tests/test_models.py
+
+# Run tests matching a keyword
+uv run pytest -k "test_ensemble"
+```
+
+Tests use temporary databases with synthetic data — they don't touch `fuel_sales.db` or any real data.
 
 ## Expected Runtimes
 
@@ -269,3 +290,4 @@ Run PowerShell as Administrator.
 | `fuel_sales.db` | SQLite database (auto-created on first load) |
 | `data/` | Put PDI Excel/CSV exports here |
 | `forecasts/` | Forecast output files |
+| `tests/` | Automated test suite (run with `uv run pytest`) |

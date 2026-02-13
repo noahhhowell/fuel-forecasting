@@ -4,7 +4,7 @@
 - `cli.py` is the entrypoint for all commands (load/status/export/forecast) and wires together database and forecasting logic.
 - `database.py` handles SQLite reads/writes and CSV/Excel ingest; `models.py` defines ETS and seasonal naive models; `forecaster.py` runs model selection/ensemble.
 - All user-facing documentation is in `README.md`. Sample data belongs in `data/` and outputs in `forecasts/` (both gitignored).
-- No dedicated test suite directory yet; add `tests/` with `test_*.py` when introducing automated checks.
+- `tests/` contains the pytest suite: `conftest.py` (shared fixtures), `test_database.py`, `test_models.py`, `test_forecaster.py`.
 
 ## Build, Test, and Development Commands
 - Install deps: `uv sync` (creates `.venv` and installs from `uv.lock`).
@@ -12,7 +12,7 @@
 - Load data: `uv run python cli.py load --file data/latest.xlsx` (CSV also supported).
 - Health check: `uv run python cli.py status --detailed` to see coverage and gaps.
 - Forecast: `uv run python cli.py forecast 2026-01 --by site_grade --output forecasts/jan_2026.xlsx` (swap `--by` level as needed).
-- If you add pytest tests, run `uv run pytest` from repo root.
+- Run tests: `uv run pytest` (53 tests, ~10s). Use `uv run pytest tests/ -v` for verbose or `uv run pytest -k "keyword"` to filter.
 
 ## Coding Style & Naming Conventions
 - Python 3.9+, 4-space indentation, keep functions and variables snake_case; classes PascalCase; constants UPPER_SNAKE.
@@ -21,9 +21,10 @@
 - Use logging (module-level logger) instead of print for diagnostics; avoid broad exceptions; raise `ValueError`/`RuntimeError` with context.
 
 ## Testing Guidelines
-- Current repo lacks automated tests; add `tests/` with `test_*.py` mirroring modules when extending logic.
-- Start with smoke runs: load a small CSV into `fuel_sales.db`, run `status --detailed`, then `forecast <month>` and inspect the Excel/CSV outputs (`Skipped` and `Summary` tabs for anomalies).
-- For new features, include fixtures for small sample datasets and assert row counts/column order/ensemble selection.
+- Test suite lives in `tests/` with one file per module: `test_database.py`, `test_models.py`, `test_forecaster.py`.
+- Shared fixtures in `tests/conftest.py` provide a temporary SQLite database pre-loaded with 36 months of synthetic data. Tests never touch `fuel_sales.db`.
+- When adding features, add corresponding tests. Cover: expected output shape, edge cases (empty data, zeros, missing months), and error paths (`pytest.raises`).
+- For manual smoke testing: load a small CSV into `fuel_sales.db`, run `status --detailed`, then `forecast <month>` and inspect the Excel/CSV outputs (`Skipped` and `Summary` tabs for anomalies).
 
 ## Commit & Pull Request Guidelines
 - Follow existing history: short, imperative summaries ("Add backtesting changes", "Update CSV export"); keep scope-focused and avoid long prefixes.

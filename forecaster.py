@@ -25,15 +25,15 @@ class FuelForecaster:
     DEFAULT_ENSEMBLE_WEIGHTS = {"ets": 0.7, "snaive": 0.3}
 
     # Shared column schemas for export (used by both Excel and CSV exporters)
-    CLEAN_COLS = [
+    CLEAN_COLS = (
         "site_id",
         "grade",
         "target_month",
         "forecast_volume",
         "prior_year_volume",
         "yoy_change_pct",
-    ]
-    DETAIL_COLS = [
+    )
+    DETAIL_COLS = (
         "site_id",
         "grade",
         "target_month",
@@ -42,7 +42,7 @@ class FuelForecaster:
         "prior_year_month",
         "prior_year_volume",
         "yoy_change_pct",
-    ]
+    )
 
     def __init__(self, database, min_months_data: int = 24):
         """
@@ -629,7 +629,7 @@ class FuelForecaster:
         prior_year_month = None
         if show_yoy:
             if prior_year_actuals is not None:
-                key = (site_id or "ALL", grade or "ALL")
+                key = (str(site_id) if site_id else "ALL", str(grade) if grade else "ALL")
                 prior_year_volume = prior_year_actuals.get(key)
             else:
                 prior_year_volume = self._get_prior_year_actual(

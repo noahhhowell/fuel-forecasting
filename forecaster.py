@@ -20,6 +20,30 @@ logger = logging.getLogger(__name__)
 class FuelForecaster:
     """Main forecasting interface"""
 
+    # Favor ETS in the default ensemble because it has shown stronger
+    # average performance and lower under-forecast bias in backtests.
+    DEFAULT_ENSEMBLE_WEIGHTS = {"ets": 0.7, "snaive": 0.3}
+
+    # Shared column schemas for export (used by both Excel and CSV exporters)
+    CLEAN_COLS = [
+        "site_id",
+        "grade",
+        "target_month",
+        "forecast_volume",
+        "prior_year_volume",
+        "yoy_change_pct",
+    ]
+    DETAIL_COLS = [
+        "site_id",
+        "grade",
+        "target_month",
+        "model",
+        "forecast_volume",
+        "prior_year_month",
+        "prior_year_volume",
+        "yoy_change_pct",
+    ]
+
     def __init__(self, database, min_months_data: int = 24):
         """
         Initialize forecaster
@@ -31,8 +55,28 @@ class FuelForecaster:
         self.db = database
         self.min_months_data = min_months_data
         self.models = {}
+        self.ensemble_weights = self.DEFAULT_ENSEMBLE_WEIGHTS.copy()
         # Softer floor for sparse site/grade combos; allows forecasting with fewer months
         self.soft_min_months = max(6, min(12, self.min_months_data))
+
+    def _compute_ensemble_forecast(self, model_forecasts: Dict[str, float]) -> float:
+        """Compute a weighted ensemble with a robust fallback."""
+        if not model_forecasts:
+            raise ValueError("Cannot compute ensemble without model forecasts")
+
+        weighted_sum = 0.0
+        weight_total = 0.0
+        for model_name, value in model_forecasts.items():
+            weight = self.ensemble_weights.get(model_name, 0.0)
+            if weight > 0:
+                weighted_sum += weight * value
+                weight_total += weight
+
+        if weight_total > 0:
+            return float(weighted_sum / weight_total)
+
+        # Fallback: preserve robust behavior for unexpected model sets.
+        return float(np.median(list(model_forecasts.values())))
 
     def prepare_monthly_data(
         self,
@@ -319,6 +363,58 @@ class FuelForecaster:
             logger.debug(f"Could not fetch prior year actual: {e}")
             return None
 
+    def _precompute_prior_year_actuals(
+        self, target_month: str
+    ) -> Dict[Tuple[str, str], float]:
+        """
+        Fetch prior-year actuals for ALL site/grade combos in a single query.
+
+        Returns:
+            Dict keyed by (site_id, grade) -> volume.
+            site_id or grade may be "ALL" for aggregate-level lookups.
+        """
+        target_date = pd.to_datetime(target_month)
+        prior_year_month = (target_date - pd.DateOffset(years=1)).strftime("%Y-%m")
+        prior_year_start = f"{prior_year_month}-01"
+        prior_year_end = (
+            pd.to_datetime(prior_year_start) + pd.offsets.MonthEnd(0)
+        ).strftime("%Y-%m-%d")
+
+        try:
+            df = self.db.get_sales_data(
+                start_date=prior_year_start,
+                end_date=prior_year_end,
+                exclude_estimated=True,
+            )
+        except Exception as e:
+            logger.debug(f"Could not fetch prior year actuals in bulk: {e}")
+            return {}
+
+        if df.empty:
+            return {}
+
+        lookup: Dict[Tuple[str, str], float] = {}
+
+        # Per site+grade
+        by_sg = df.groupby(["site_id", "grade"])["volume"].sum()
+        for (sid, gr), vol in by_sg.items():
+            lookup[(str(sid), str(gr))] = float(vol)
+
+        # Per site (grade=ALL)
+        by_site = df.groupby("site_id")["volume"].sum()
+        for sid, vol in by_site.items():
+            lookup[(str(sid), "ALL")] = float(vol)
+
+        # Per grade (site=ALL)
+        by_grade = df.groupby("grade")["volume"].sum()
+        for gr, vol in by_grade.items():
+            lookup[("ALL", str(gr))] = float(vol)
+
+        # Grand total
+        lookup[("ALL", "ALL")] = float(df["volume"].sum())
+
+        return lookup
+
     def _calculate_yoy_change(
         self, forecast_volume: float, prior_year_volume: Optional[float]
     ) -> Optional[float]:
@@ -502,6 +598,7 @@ class FuelForecaster:
         monthly_data: Optional[pd.DataFrame] = None,
         monthly_data_raw: Optional[pd.DataFrame] = None,
         show_yoy: bool = True,
+        prior_year_actuals: Optional[Dict[Tuple[str, str], float]] = None,
     ) -> pd.DataFrame:
         """
         Generate forecast for a specific month
@@ -514,6 +611,7 @@ class FuelForecaster:
             monthly_data: Pre-computed monthly data WITH outlier handling (for ETS)
             monthly_data_raw: Pre-computed monthly data WITHOUT outlier handling (for snaive)
             show_yoy: Include year-over-year comparison columns (default: True)
+            prior_year_actuals: Pre-computed lookup from _precompute_prior_year_actuals (bulk mode)
 
         Returns:
             DataFrame with forecasts from all models
@@ -530,9 +628,13 @@ class FuelForecaster:
         prior_year_volume = None
         prior_year_month = None
         if show_yoy:
-            prior_year_volume = self._get_prior_year_actual(
-                target_month, site_id=site_id, grade=grade
-            )
+            if prior_year_actuals is not None:
+                key = (site_id or "ALL", grade or "ALL")
+                prior_year_volume = prior_year_actuals.get(key)
+            else:
+                prior_year_volume = self._get_prior_year_actual(
+                    target_month, site_id=site_id, grade=grade
+                )
             prior_year_month = (target_date - pd.DateOffset(years=1)).strftime("%Y-%m")
 
         monthly_data_was_provided = monthly_data is not None
@@ -581,7 +683,7 @@ class FuelForecaster:
 
         # Generate predictions - train each model with appropriate data
         results = []
-        forecasts_for_ensemble = []
+        forecasts_for_ensemble: Dict[str, float] = {}
         note = quality_note
         fallback_value = None
 
@@ -609,16 +711,31 @@ class FuelForecaster:
                     # Use last available prediction if exact date doesn't match
                     target_pred = predictions.iloc[-1:].copy()
 
-                forecast_value = target_pred["forecast"].values[0]
-                forecasts_for_ensemble.append(forecast_value)
+                forecast_value = float(target_pred["forecast"].values[0])
+                if not np.isfinite(forecast_value):
+                    raise ValueError(f"{model_name} produced non-finite forecast")
+                forecasts_for_ensemble[model_name] = forecast_value
 
-                # Check if snaive used fallback (missing same-month data)
+                # Check if snaive used fallback for the selected target prediction
                 model_note = note
                 used_fallback = False
-                if model_name == "snaive" and hasattr(model, "last_prediction_used_fallback"):
-                    if model.last_prediction_used_fallback:
-                        used_fallback = True
-                        fallback_note = f"SNAIVE used fallback (no same-month data for: {', '.join(model.fallback_months)})"
+                if model_name == "snaive":
+                    if "used_fallback" in target_pred.columns:
+                        target_used_fallback = target_pred["used_fallback"].iloc[0]
+                        used_fallback = (
+                            bool(target_used_fallback)
+                            if pd.notna(target_used_fallback)
+                            else False
+                        )
+                    elif hasattr(model, "last_prediction_used_fallback"):
+                        # Backward-compatible fallback if model output does not expose per-period metadata
+                        used_fallback = bool(model.last_prediction_used_fallback)
+
+                    if used_fallback:
+                        target_pred_month = target_date.strftime("%Y-%m")
+                        fallback_note = (
+                            f"SNAIVE used fallback (no same-month data for: {target_pred_month})"
+                        )
                         model_note = f"{note}; {fallback_note}" if note else fallback_note
                         logger.debug(fallback_note)
 
@@ -648,7 +765,7 @@ class FuelForecaster:
             fallback_value = self._fallback_forecast_value(
                 monthly_data, months_ahead, quality_note
             )
-            forecasts_for_ensemble.append(fallback_value)
+            forecasts_for_ensemble["FALLBACK"] = fallback_value
             fallback_row = {
                 "model": "FALLBACK",
                 "target_month": target_month,
@@ -673,10 +790,9 @@ class FuelForecaster:
 
         ensemble_note = note or ("Used fallback forecast" if fallback_value is not None else None)
 
-        # Add ensemble (robust median instead of mean)
+        # Add ensemble (weighted ETS/Snaive; robust fallback for other model sets)
         if forecasts_for_ensemble:
-            # Median is more robust to outlier models
-            ensemble_forecast = float(np.median(forecasts_for_ensemble))
+            ensemble_forecast = self._compute_ensemble_forecast(forecasts_for_ensemble)
 
             # Check if any snaive result used fallback
             snaive_fallback_in_results = any(
@@ -732,6 +848,9 @@ class FuelForecaster:
         all_forecasts = []
         skipped = []
 
+        # Precompute all prior-year actuals in one query for the entire run
+        pya = self._precompute_prior_year_actuals(target_month) if show_yoy else None
+
         if by == "grade":
             stats = self.db.get_summary_stats()
             raw_grades = stats.get("fuel_grades", [])
@@ -755,7 +874,8 @@ class FuelForecaster:
                 logger.info(f"  [{i}/{len(grades)}] Grade: {grade}")
                 try:
                     forecast = self.generate_forecast(
-                        target_month, grade=grade, models_to_use=models_to_use, show_yoy=show_yoy
+                        target_month, grade=grade, models_to_use=models_to_use,
+                        show_yoy=show_yoy, prior_year_actuals=pya,
                     )
                     all_forecasts.append(forecast)
                 except Exception as e:
@@ -800,6 +920,7 @@ class FuelForecaster:
                         monthly_data=site_monthly_data,
                         monthly_data_raw=site_monthly_data_raw,
                         show_yoy=show_yoy,
+                        prior_year_actuals=pya,
                     )
                     all_forecasts.append(forecast)
 
@@ -855,6 +976,7 @@ class FuelForecaster:
                         monthly_data=combo_monthly_data,
                         monthly_data_raw=combo_monthly_data_raw,
                         show_yoy=show_yoy,
+                        prior_year_actuals=pya,
                     )
                     all_forecasts.append(forecast)
 
@@ -1243,27 +1365,8 @@ class FuelForecaster:
         self, forecasts: pd.DataFrame, skipped: List[Dict], output_path: str
     ):
         """Export forecasts to Excel with multiple sheets"""
-        # Clean column order for the main Forecasts sheet (ENSEMBLE only)
-        clean_cols = [
-            "site_id",
-            "grade",
-            "target_month",
-            "forecast_volume",
-            "prior_year_volume",
-            "yoy_change_pct",
-        ]
-
-        # Full column order for the Model Detail sheet (all models + diagnostics)
-        detail_order = [
-            "site_id",
-            "grade",
-            "target_month",
-            "model",
-            "forecast_volume",
-            "prior_year_month",
-            "prior_year_volume",
-            "yoy_change_pct",
-        ]
+        clean_cols = self.CLEAN_COLS
+        detail_order = self.DETAIL_COLS
 
         has_grade_detail = "grade" in forecasts.columns and (forecasts["grade"] != "ALL").any()
 
@@ -1322,15 +1425,7 @@ class FuelForecaster:
         self, forecasts: pd.DataFrame, skipped: List[Dict], output_path: str
     ):
         """Export forecasts to CSV; companion files go alongside main file"""
-        # Main file: ENSEMBLE only, clean columns
-        clean_cols = [
-            "site_id",
-            "grade",
-            "target_month",
-            "forecast_volume",
-            "prior_year_volume",
-            "yoy_change_pct",
-        ]
+        clean_cols = self.CLEAN_COLS
 
         ensemble = forecasts[forecasts["model"] == "ENSEMBLE"].copy()
         if ensemble.empty:
@@ -1363,17 +1458,7 @@ class FuelForecaster:
                 logger.info(f"  -> Product Summary saved to: {product_summary_path}")
 
         # Model Detail: all models with full columns
-        detail_order = [
-            "site_id",
-            "grade",
-            "target_month",
-            "model",
-            "forecast_volume",
-            "prior_year_month",
-            "prior_year_volume",
-            "yoy_change_pct",
-        ]
-        detail_cols = [c for c in detail_order if c in forecasts.columns]
+        detail_cols = [c for c in self.DETAIL_COLS if c in forecasts.columns]
         remaining_cols = [c for c in forecasts.columns if c not in detail_cols]
         detail_path = base.with_name(f"{base.stem}_model_detail.csv")
         forecasts[detail_cols + remaining_cols].to_csv(detail_path, index=False)

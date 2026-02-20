@@ -23,6 +23,15 @@ from forecaster import FuelForecaster
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Tuning constants
+# ---------------------------------------------------------------------------
+
+# MAPE thresholds for site accuracy ratings.
+# <5% is considered "Good", 5-10% "Acceptable", >=10% "Review".
+MAPE_GOOD_THRESHOLD = 5
+MAPE_ACCEPTABLE_THRESHOLD = 10
+
 
 def get_actual_monthly_volume(db, site_id, month_str):
     """Get actual total volume for a site in a given month."""
@@ -37,6 +46,88 @@ def get_actual_monthly_volume(db, site_id, month_str):
     return float(df["volume"].sum())
 
 
+def _trimmed_mean_drop_worst(values: pd.Series) -> float:
+    """Mean after dropping the single worst month (highest APE) per site."""
+    if values.empty:
+        return np.nan
+    if len(values) <= 1:
+        return float(values.mean())
+    sorted_vals = values.sort_values()
+    return float(sorted_vals.iloc[:-1].mean())
+
+
+def build_site_error_metrics(results_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build per-site error metrics including robust measures.
+
+    Returns columns:
+      site_id, mape_pct, median_ape_pct, trimmed_mape_pct, max_ape_pct, n_months, rating
+    """
+    if results_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "site_id",
+                "mape_pct",
+                "median_ape_pct",
+                "trimmed_mape_pct",
+                "max_ape_pct",
+                "n_months",
+                "rating",
+            ]
+        )
+
+    clean = results_df.copy()
+    clean["error_pct"] = pd.to_numeric(clean["error_pct"], errors="coerce")
+    clean = clean[np.isfinite(clean["error_pct"])].copy()
+    if clean.empty:
+        return pd.DataFrame(
+            columns=[
+                "site_id",
+                "mape_pct",
+                "median_ape_pct",
+                "trimmed_mape_pct",
+                "max_ape_pct",
+                "n_months",
+                "rating",
+            ]
+        )
+
+    grouped = clean.groupby("site_id")["error_pct"]
+    site_metrics = (
+        grouped.agg(
+            mape_pct="mean",
+            median_ape_pct="median",
+            max_ape_pct="max",
+            n_months="count",
+        )
+        .reset_index()
+    )
+
+    trimmed = (
+        grouped.apply(_trimmed_mean_drop_worst)
+        .reset_index(name="trimmed_mape_pct")
+    )
+    site_metrics = site_metrics.merge(trimmed, on="site_id", how="left")
+    site_metrics = site_metrics.sort_values("mape_pct", ascending=False)
+
+    site_metrics["rating"] = pd.cut(
+        site_metrics["mape_pct"],
+        bins=[-np.inf, MAPE_GOOD_THRESHOLD, MAPE_ACCEPTABLE_THRESHOLD, np.inf],
+        labels=["Good", "Acceptable", "Review"],
+    )
+    return site_metrics
+
+
+def _parse_max_date(stats: dict) -> pd.Timestamp:
+    """Extract the end date from summary stats, raising a clear error on failure."""
+    date_range = stats.get("date_range", "")
+    if not isinstance(date_range, str) or " to " not in date_range:
+        raise RuntimeError(
+            f"Unexpected date_range format in summary stats: {date_range!r}"
+        )
+    return pd.to_datetime(date_range.split(" to ")[1])
+
+
 def run_backtest(db_path="fuel_sales.db", months=6, output=None, min_months=24, horizon=2):
     if months < 1:
         raise ValueError("months must be >= 1")
@@ -46,23 +137,26 @@ def run_backtest(db_path="fuel_sales.db", months=6, output=None, min_months=24, 
         raise ValueError("horizon must be >= 0")
 
     db = FuelDatabase(db_path)
+    try:
+        return _run_backtest_inner(db, months, output, min_months, horizon)
+    finally:
+        db.close()
+
+
+def _run_backtest_inner(db, months, output, min_months, horizon):
+    """Core backtest logic, called inside a try/finally that guarantees db.close()."""
     forecaster = FuelForecaster(db, min_months_data=min_months)
 
-    # Find the date range in the database
     stats = db.get_summary_stats()
     if not stats.get("total_records"):
-        db.close()
         raise RuntimeError("Database is empty. Load data before running backtest.")
-    max_date = pd.to_datetime(stats["date_range"].split(" to ")[1])
+    max_date = _parse_max_date(stats)
 
     # Build list of test months (most recent complete months)
-    # A "complete" month is one that ended before the last date in the DB
     last_complete = (max_date.to_period("M") - 1).to_timestamp()
-    test_months = []
-    for i in range(months):
-        m = (last_complete.to_period("M") - i).to_timestamp()
-        test_months.append(m)
-    test_months.sort()
+    test_months = sorted(
+        (last_complete.to_period("M") - i).to_timestamp() for i in range(months)
+    )
 
     # Get sites with enough data
     sites_df = db.get_distinct_sites()
@@ -70,12 +164,10 @@ def run_backtest(db_path="fuel_sales.db", months=6, output=None, min_months=24, 
     print(f"Test period: {test_months[0].strftime('%Y-%m')} to {test_months[-1].strftime('%Y-%m')}")
     print(f"Checking data sufficiency...\n")
 
-    # Pre-filter sites: need enough history before the earliest test month
     earliest_test = test_months[0]
     qualified_sites = []
     for _, row in sites_df.iterrows():
         site_id = row["site_id"]
-        # Check months of data before earliest test month
         cutoff = (earliest_test - pd.DateOffset(months=horizon, days=1)).strftime("%Y-%m-%d")
         try:
             data = forecaster.prepare_monthly_data(
@@ -90,11 +182,11 @@ def run_backtest(db_path="fuel_sales.db", months=6, output=None, min_months=24, 
     print(f"Sites with >= {min_months} months of pre-test data: {len(qualified_sites)}")
     if not qualified_sites:
         print("No sites have enough data for backtesting.")
-        db.close()
         return None, None
 
     # Run forecasts for each site x test month
     results = []
+    skipped_count = 0
     total_combos = len(qualified_sites) * len(test_months)
     done = 0
 
@@ -106,13 +198,10 @@ def run_backtest(db_path="fuel_sales.db", months=6, output=None, min_months=24, 
 
             target = test_month.strftime("%Y-%m")
 
-            # Get actual volume for this month
             actual = get_actual_monthly_volume(db, site_id, target)
             if actual is None or actual <= 0:
                 continue
 
-            # Cutoff: simulate real-world data availability at forecast submission
-            # horizon=2 means forecasting 2 months ahead, so data through (target - horizon - 1) month
             cutoff = (test_month - pd.DateOffset(months=horizon, days=1)).strftime("%Y-%m-%d")
 
             try:
@@ -151,56 +240,68 @@ def run_backtest(db_path="fuel_sales.db", months=6, output=None, min_months=24, 
                     "error_pct": round(error_pct, 2),
                 })
 
+            except (ValueError, KeyError) as e:
+                # Expected data-related errors — count them so the user sees the skip rate
+                skipped_count += 1
+                logger.info(f"Skipped site {site_id}, month {target}: {e}")
+                continue
             except Exception as e:
-                logger.debug(f"Site {site_id}, month {target}: {e}")
+                # Unexpected errors — log at warning so they surface
+                skipped_count += 1
+                logger.warning(f"Site {site_id}, month {target}: {e}")
                 continue
 
     print()  # clear progress line
 
+    if skipped_count:
+        print(f"  Skipped {skipped_count} site-month combos (see log for details)")
+
     if not results:
         print("No results generated. Check that test months have actual data.")
-        db.close()
         return None, None
 
     results_df = pd.DataFrame(results)
 
-    # Calculate MAPE per site
-    site_mape = (
-        results_df.groupby("site_id")["error_pct"]
-        .mean()
-        .reset_index()
-        .rename(columns={"error_pct": "mape_pct"})
-        .sort_values("mape_pct", ascending=False)
-    )
+    site_mape = build_site_error_metrics(results_df)
 
-    # Add rating
-    site_mape["rating"] = pd.cut(
-        site_mape["mape_pct"],
-        bins=[-np.inf, 5, 10, np.inf],
-        labels=["Good", "Acceptable", "Review"],
-    )
-
-    # Print summary
     overall_mape = results_df["error_pct"].mean()
-    good = (site_mape["mape_pct"] < 5).sum()
-    acceptable = ((site_mape["mape_pct"] >= 5) & (site_mape["mape_pct"] < 10)).sum()
-    review = (site_mape["mape_pct"] >= 10).sum()
+    overall_median_ape = results_df["error_pct"].median()
+    overall_trimmed_mape = site_mape["trimmed_mape_pct"].mean()
+    good = (site_mape["mape_pct"] < MAPE_GOOD_THRESHOLD).sum()
+    acceptable = (
+        (site_mape["mape_pct"] >= MAPE_GOOD_THRESHOLD)
+        & (site_mape["mape_pct"] < MAPE_ACCEPTABLE_THRESHOLD)
+    ).sum()
+    review = (site_mape["mape_pct"] >= MAPE_ACCEPTABLE_THRESHOLD).sum()
     total_sites = len(site_mape)
+    pct = lambda n: round(n * 100 / total_sites) if total_sites else 0
 
     print(f"Backtest: {months} months, {total_sites} sites\n")
     print(f"Overall MAPE: {overall_mape:.1f}%\n")
-    print(f"  MAPE < 5%:  {good:>4} sites ({round(good*100/total_sites)}%) - Good")
-    print(f"  MAPE 5-10%: {acceptable:>4} sites ({round(acceptable*100/total_sites)}%) - Acceptable")
-    print(f"  MAPE > 10%: {review:>4} sites ({round(review*100/total_sites)}%) - Review these")
+    print(f"Median APE (all site-month rows): {overall_median_ape:.1f}%")
+    print(f"Trimmed MAPE (drop each site's worst month): {overall_trimmed_mape:.1f}%\n")
+    print(f"  MAPE < 5%:  {good:>4} sites ({pct(good)}%) - Good")
+    print(f"  MAPE 5-10%: {acceptable:>4} sites ({pct(acceptable)}%) - Acceptable")
+    print(f"  MAPE > 10%: {review:>4} sites ({pct(review)}%) - Review these")
 
-    # Save to Excel if requested
     if output:
+        summary_df = pd.DataFrame(
+            [
+                {"metric": "overall_mape_pct", "value": round(float(overall_mape), 4)},
+                {"metric": "overall_median_ape_pct", "value": round(float(overall_median_ape), 4)},
+                {"metric": "overall_trimmed_mape_pct", "value": round(float(overall_trimmed_mape), 4)},
+                {"metric": "sites_total", "value": int(total_sites)},
+                {"metric": "sites_good_lt_5_count", "value": int(good)},
+                {"metric": "sites_acceptable_5_to_10_count", "value": int(acceptable)},
+                {"metric": "sites_review_ge_10_count", "value": int(review)},
+            ]
+        )
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             results_df.to_excel(writer, sheet_name="Results", index=False)
+            summary_df.to_excel(writer, sheet_name="Summary", index=False)
             site_mape.round(2).to_excel(writer, sheet_name="Site MAPE", index=False)
         print(f"\nSaved detail to: {output}")
 
-    db.close()
     return results_df, site_mape
 
 

@@ -17,6 +17,18 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Tuning constants
+# ---------------------------------------------------------------------------
+
+# Coefficient of variation threshold for choosing multiplicative vs additive
+# seasonality.  CV > 0.3 implies seasonal amplitude scales with level, so
+# multiplicative is more appropriate.
+SEASONALITY_CV_THRESHOLD = 0.3
+
+# Tiny epsilon to avoid division by zero when computing CV.
+MEAN_ZERO_EPSILON = 1e-9
+
 
 class ForecastModel(ABC):
     """Base class for forecast models"""
@@ -179,8 +191,8 @@ class ETSModel(ForecastModel):
             return "add"
         mean = float(np.mean(y))
         std = float(np.std(y))
-        cv = std / mean if mean > 1e-9 else 0.0
-        return "mul" if cv > 0.3 else "add"
+        cv = std / mean if mean > MEAN_ZERO_EPSILON else 0.0
+        return "mul" if cv > SEASONALITY_CV_THRESHOLD else "add"
 
     def fit(self, data: pd.DataFrame):
         """Fit ETS model with adaptive parameters"""

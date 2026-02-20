@@ -16,6 +16,59 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Tuning constants  (documented rationale for each threshold)
+# ---------------------------------------------------------------------------
+
+# Soft floor for data-sufficiency checks: allows forecasting sparse site/grade
+# combos with as few as 6 months while recommending 24.  Clamped to [6, 12].
+SOFT_MIN_MONTHS_FLOOR = 6
+SOFT_MIN_MONTHS_CEIL = 12
+
+# Rolling-window size (months) for outlier statistics.  18 months captures one
+# full seasonal cycle plus 6 months of trend, keeping the detector responsive
+# to legitimate business changes while smoothing noise.
+OUTLIER_WINDOW_MONTHS = 18
+
+# Rolling-median window used inside the spike detector.
+SPIKE_ROLLING_WINDOW = 6
+
+# Spike multiplier: a single month exceeding 8x the rolling median is almost
+# certainly a data error (double-scanned load, unit mismatch, etc.).  A lower
+# cap (e.g. 5x) clipped legitimate seasonal peaks in backtests.
+SPIKE_MULTIPLIER = 8
+
+# Minimum consecutive trailing months above a threshold before we treat the
+# pattern as a real business level-shift rather than data errors.
+LEVEL_SHIFT_MIN_TRAILING = 3
+
+# Asymmetric MAD bounds for outlier detection.  The lower bound is tighter
+# (4×MAD) because near-zero months are almost always errors (system outages,
+# store closures misrecorded as zero sales).  The upper bound is looser
+# (6×MAD) because legitimate upside surprises (new customer, promo) are more
+# common than downside errors.
+MAD_LOWER_MULTIPLIER = 4.0
+MAD_UPPER_MULTIPLIER = 6.0
+
+# Degenerate-series fallback bands when MAD == 0 (constant series).
+DEGENERATE_LOWER_FACTOR = 0.5
+DEGENERATE_UPPER_FACTOR = 2.0
+
+
+def _normalize_filter(value: Optional[str]) -> Optional[str]:
+    """Coerce empty/whitespace-only strings to None for site_id / grade filters."""
+    if isinstance(value, str) and value.strip() == "":
+        return None
+    return value
+
+
+def _reorder_columns(df: pd.DataFrame, desired_order: List[str]) -> pd.DataFrame:
+    """Reorder *df* columns: *desired_order* first, then any remaining."""
+    ordered = [c for c in desired_order if c in df.columns]
+    ordered_set = set(ordered)
+    remaining = [c for c in df.columns if c not in ordered_set]
+    return df[ordered + remaining]
+
 
 class FuelForecaster:
     """Main forecasting interface"""
@@ -57,7 +110,9 @@ class FuelForecaster:
         self.models = {}
         self.ensemble_weights = self.DEFAULT_ENSEMBLE_WEIGHTS.copy()
         # Softer floor for sparse site/grade combos; allows forecasting with fewer months
-        self.soft_min_months = max(6, min(12, self.min_months_data))
+        self.soft_min_months = max(
+            SOFT_MIN_MONTHS_FLOOR, min(SOFT_MIN_MONTHS_CEIL, self.min_months_data)
+        )
 
     def _compute_ensemble_forecast(self, model_forecasts: Dict[str, float]) -> float:
         """Compute a weighted ensemble with a robust fallback."""
@@ -102,10 +157,8 @@ class FuelForecaster:
         Returns:
             DataFrame with monthly volume data
         """
-        if isinstance(site_id, str) and site_id.strip() == "":
-            site_id = None
-        if isinstance(grade, str) and grade.strip() == "":
-            grade = None
+        site_id = _normalize_filter(site_id)
+        grade = _normalize_filter(grade)
 
         site_ids = [site_id] if site_id else None
         grades = [grade] if grade else None
@@ -210,70 +263,73 @@ class FuelForecaster:
         df = data.copy()
         site_label = f"Site {site_id}" if site_id else "Dataset"
 
-        # Use rolling window for statistics (adapts to business changes)
-        # 18 months captures seasonality while being responsive to trends
-        window_size = min(18, len(df))
-        recent_data = df.tail(window_size)
-        recent_volumes = recent_data["volume"].values
+        window_size = min(OUTLIER_WINDOW_MONTHS, len(df))
 
-        # Clip extreme spikes relative to rolling median to avoid single-month blowups
-        if len(df) >= 4:
-            rolling_median = (
-                df["volume"].rolling(window=6, min_periods=1).median().replace(0, np.nan)
-            )
-            # More permissive: 8x rolling median instead of 5x
-            spike_cap = rolling_median * 8
-            spike_mask = df["volume"] > spike_cap.fillna(df["volume"].max() * 2)
+        # Phase 1: cap extreme spikes relative to rolling median
+        df = self._detect_spikes(df, site_label)
 
-            if spike_mask.any():
-                # Protect sustained trailing level shifts: 3+ consecutive months
-                # above the spike cap indicate a real business change, not data errors
-                trailing = self._count_trailing_true(spike_mask)
-                if trailing >= 3:
-                    spike_mask.iloc[-trailing:] = False
-                    logger.info(
-                        f"  {site_label}: Step-change detected - preserving "
-                        f"trailing {trailing} month(s) from spike cap"
-                    )
+        # Phase 2: MAD-based outlier detection on the (now spike-free) tail
+        df = self._detect_mad_outliers(df, window_size, site_label)
 
-            if spike_mask.any():
-                capped = int(spike_mask.sum())
-                df.loc[spike_mask, "volume"] = spike_cap[spike_mask].fillna(
-                    df["volume"].median()
-                )
+        return df
+
+    # -- outlier sub-routines --------------------------------------------------
+
+    def _detect_spikes(self, df: pd.DataFrame, site_label: str) -> pd.DataFrame:
+        """Cap single-month volume spikes that exceed SPIKE_MULTIPLIER × rolling median."""
+        if len(df) < 4:
+            return df
+
+        rolling_median = (
+            df["volume"]
+            .rolling(window=SPIKE_ROLLING_WINDOW, min_periods=1)
+            .median()
+            .replace(0, np.nan)
+        )
+        spike_cap = rolling_median * SPIKE_MULTIPLIER
+        spike_mask = df["volume"] > spike_cap.fillna(df["volume"].max() * 2)
+
+        if spike_mask.any():
+            trailing = self._count_trailing_true(spike_mask)
+            if trailing >= LEVEL_SHIFT_MIN_TRAILING:
+                spike_mask.iloc[-trailing:] = False
                 logger.info(
-                    f"  {site_label}: Capped {capped} spike(s) at 8x rolling median"
+                    f"  {site_label}: Step-change detected - preserving "
+                    f"trailing {trailing} month(s) from spike cap"
                 )
 
-        # Recompute recent volumes after spike capping so MAD uses cleaned data
-        recent_data = df.tail(window_size)
-        recent_volumes = recent_data["volume"].values
+        if spike_mask.any():
+            capped = int(spike_mask.sum())
+            df.loc[spike_mask, "volume"] = spike_cap[spike_mask].fillna(
+                df["volume"].median()
+            )
+            logger.info(
+                f"  {site_label}: Capped {capped} spike(s) at "
+                f"{SPIKE_MULTIPLIER}x rolling median"
+            )
 
-        # Use MAD method on RECENT data (more robust to business changes)
+        return df
+
+    def _detect_mad_outliers(
+        self, df: pd.DataFrame, window_size: int, site_label: str
+    ) -> pd.DataFrame:
+        """Detect and clip outliers using a rolling-window MAD method."""
+        recent_volumes = df.tail(window_size)["volume"].values
         median = np.median(recent_volumes)
         MAD = np.median(np.abs(recent_volumes - median))
 
-        # Guard against degenerate series (MAD==0 or NaN)
         if not (MAD > 0 and np.isfinite(MAD)):
-            # Degenerate series: use a wider band
-            lower_bound = max(0.0, median * 0.5)
-            upper_bound = median * 2.0
+            lower_bound = max(0.0, median * DEGENERATE_LOWER_FACTOR)
+            upper_bound = median * DEGENERATE_UPPER_FACTOR
         else:
-            # Define outlier boundaries using recent statistics
-            # Lower: catch data errors (zeros, negative-like entries)
-            # Upper: use MAD-based bound that adapts to recent variance
-            lower_bound = max(0.0, median - 4.0 * MAD)
-            upper_bound = median + 6.0 * MAD  # MAD-based, adapts to recent variance
+            lower_bound = max(0.0, median - MAD_LOWER_MULTIPLIER * MAD)
+            upper_bound = median + MAD_UPPER_MULTIPLIER * MAD
 
-        # Identify outliers
         volumes = df["volume"].values
         outlier_mask = (volumes < lower_bound) | (volumes > upper_bound)
 
-        # Protect sustained trailing level shifts: 3+ consecutive months outside
-        # bounds indicate a real business change (e.g., high-speed diesel upgrade,
-        # new store ramp-up), not data errors
         trailing = self._count_trailing_true(outlier_mask)
-        if trailing >= 3:
+        if trailing >= LEVEL_SHIFT_MIN_TRAILING:
             outlier_mask[-trailing:] = False
             logger.info(
                 f"  {site_label}: Step-change detected - preserving "
@@ -285,12 +341,10 @@ class FuelForecaster:
         outlier_count = len(outlier_indices)
 
         if outlier_count > 0:
-            # Clip only flagged outliers, not step-change protected months
             df.loc[outlier_indices, "volume"] = df.loc[
                 outlier_indices, "volume"
             ].clip(lower=lower_bound, upper=upper_bound)
 
-            # Log details for audit trail
             outlier_dates = (
                 df.loc[outlier_indices, "date"].dt.strftime("%Y-%m").tolist()
             )
@@ -589,6 +643,93 @@ class FuelForecaster:
         self.models = trained_models
         return trained_models
 
+    # -- generate_forecast helpers -------------------------------------------
+
+    def _fit_and_predict_model(
+        self,
+        model_name: str,
+        monthly_data: pd.DataFrame,
+        monthly_data_raw: pd.DataFrame,
+        target_date: pd.Timestamp,
+        months_ahead: int,
+    ) -> Tuple[float, bool]:
+        """Fit *model_name*, predict, and return (forecast_value, snaive_used_fallback).
+
+        Raises on failure so the caller can log and continue.
+        """
+        available_models = get_available_models()
+        model = available_models[model_name]()
+
+        # Use raw data for snaive (preserves actual historical values)
+        # Use outlier-handled data for ETS (benefits from cleaned data)
+        if model_name == "snaive":
+            model.fit(monthly_data_raw)
+        else:
+            model.fit(monthly_data)
+
+        predictions = model.predict(periods=months_ahead)
+
+        # Get forecast for target month
+        target_pred = predictions[predictions["date"] == target_date]
+        if target_pred.empty:
+            target_pred = predictions.iloc[-1:].copy()
+
+        forecast_value = float(target_pred["forecast"].values[0])
+        if not np.isfinite(forecast_value):
+            raise ValueError(f"{model_name} produced non-finite forecast")
+
+        # Check if snaive used fallback for the selected target prediction
+        used_fallback = False
+        if model_name == "snaive":
+            if "used_fallback" in target_pred.columns:
+                target_used_fallback = target_pred["used_fallback"].iloc[0]
+                used_fallback = (
+                    bool(target_used_fallback)
+                    if pd.notna(target_used_fallback)
+                    else False
+                )
+            elif hasattr(model, "last_prediction_used_fallback"):
+                used_fallback = bool(model.last_prediction_used_fallback)
+
+        return forecast_value, used_fallback
+
+    def _build_result_row(
+        self,
+        model_name: str,
+        forecast_value: float,
+        target_month: str,
+        site_id: Optional[str],
+        grade: Optional[str],
+        months_available: int,
+        data_quality: str,
+        note: Optional[str],
+        used_fallback: bool,
+        show_yoy: bool,
+        prior_year_month: Optional[str],
+        prior_year_volume: Optional[float],
+    ) -> Dict[str, Any]:
+        """Build a single result-row dict, optionally including YoY columns."""
+        row: Dict[str, Any] = {
+            "model": model_name,
+            "target_month": target_month,
+            "forecast_volume": forecast_value,
+            "site_id": site_id or "ALL",
+            "grade": grade or "ALL",
+            "months_available": months_available,
+            "data_quality": data_quality,
+            "note": note,
+            "snaive_used_fallback": used_fallback if model_name == "snaive" else None,
+        }
+        if show_yoy:
+            row["prior_year_month"] = prior_year_month
+            row["prior_year_volume"] = prior_year_volume
+            row["yoy_change_pct"] = self._calculate_yoy_change(
+                forecast_value, prior_year_volume
+            )
+        return row
+
+    # -- main entry point ----------------------------------------------------
+
     def generate_forecast(
         self,
         target_month: str,
@@ -616,10 +757,8 @@ class FuelForecaster:
         Returns:
             DataFrame with forecasts from all models
         """
-        if isinstance(site_id, str) and site_id.strip() == "":
-            site_id = None
-        if isinstance(grade, str) and grade.strip() == "":
-            grade = None
+        site_id = _normalize_filter(site_id)
+        grade = _normalize_filter(grade)
 
         # Normalize target month to first day of month
         target_date = pd.to_datetime(target_month).to_period("M").to_timestamp()
@@ -642,46 +781,35 @@ class FuelForecaster:
 
         # Use cached data or prepare fresh
         if monthly_data is None:
-            # Check data sufficiency (log warning if low, but don't block)
             check = self.check_data_sufficiency(site_id=site_id, grade=grade)
             if not check["sufficient"]:
                 logger.warning(
                     f"Low data warning: {check['months_available']} months "
                     f"(recommended: {check['months_required']}). Forecasting anyway."
                 )
-
-            # Prepare data with outlier handling (for ETS)
             monthly_data = self.prepare_monthly_data(site_id=site_id, grade=grade, handle_outliers=True)
 
-        # Prepare raw data for snaive (no outlier handling, no gap filling - use exact historical values)
         if monthly_data_raw is None:
             monthly_data_raw = self.prepare_monthly_data(site_id=site_id, grade=grade, handle_outliers=False, fill_gaps=False)
 
         last_date = monthly_data["date"].max()
-
-        # Calculate periods ahead
         months_ahead = (target_date.year - last_date.year) * 12 + (
             target_date.month - last_date.month
         )
-
         if months_ahead <= 0:
             raise ValueError(f"Target month {target_month} is not in the future")
 
-        # Use raw data for sufficiency/quality when both series represent the same
-        # history window. If caller provided only processed data, stay consistent
-        # with that caller-provided window.
         if monthly_data_raw_was_provided or not monthly_data_was_provided:
             months_available = len(monthly_data_raw)
         else:
             months_available = len(monthly_data)
         data_quality, quality_note = self._assess_data_quality(months_available)
 
-        # Get available models
         available_models = get_available_models()
         if models_to_use is None:
             models_to_use = list(available_models.keys())
 
-        # Generate predictions - train each model with appropriate data
+        # Generate predictions — train each model with appropriate data
         results = []
         forecasts_for_ensemble: Dict[str, float] = {}
         note = quality_note
@@ -691,73 +819,28 @@ class FuelForecaster:
             if model_name not in available_models:
                 logger.warning(f"Model {model_name} not available")
                 continue
-
             try:
-                model = available_models[model_name]()
-
-                # Use raw data for snaive (preserves actual historical values)
-                # Use outlier-handled data for ETS (benefits from cleaned data)
-                if model_name == "snaive":
-                    model.fit(monthly_data_raw)
-                else:
-                    model.fit(monthly_data)
-
-                predictions = model.predict(periods=months_ahead)
-
-                # Get forecast for target month
-                target_pred = predictions[predictions["date"] == target_date]
-
-                if target_pred.empty:
-                    # Use last available prediction if exact date doesn't match
-                    target_pred = predictions.iloc[-1:].copy()
-
-                forecast_value = float(target_pred["forecast"].values[0])
-                if not np.isfinite(forecast_value):
-                    raise ValueError(f"{model_name} produced non-finite forecast")
+                forecast_value, used_fallback = self._fit_and_predict_model(
+                    model_name, monthly_data, monthly_data_raw,
+                    target_date, months_ahead,
+                )
                 forecasts_for_ensemble[model_name] = forecast_value
 
-                # Check if snaive used fallback for the selected target prediction
                 model_note = note
-                used_fallback = False
-                if model_name == "snaive":
-                    if "used_fallback" in target_pred.columns:
-                        target_used_fallback = target_pred["used_fallback"].iloc[0]
-                        used_fallback = (
-                            bool(target_used_fallback)
-                            if pd.notna(target_used_fallback)
-                            else False
-                        )
-                    elif hasattr(model, "last_prediction_used_fallback"):
-                        # Backward-compatible fallback if model output does not expose per-period metadata
-                        used_fallback = bool(model.last_prediction_used_fallback)
-
-                    if used_fallback:
-                        target_pred_month = target_date.strftime("%Y-%m")
-                        fallback_note = (
-                            f"SNAIVE used fallback (no same-month data for: {target_pred_month})"
-                        )
-                        model_note = f"{note}; {fallback_note}" if note else fallback_note
-                        logger.debug(fallback_note)
-
-                result_row = {
-                    "model": model_name,
-                    "target_month": target_month,
-                    "forecast_volume": forecast_value,
-                    "site_id": site_id or "ALL",
-                    "grade": grade or "ALL",
-                    "months_available": months_available,
-                    "data_quality": data_quality,
-                    "note": model_note,
-                    "snaive_used_fallback": used_fallback if model_name == "snaive" else None,
-                }
-                # Add YoY columns if enabled
-                if show_yoy:
-                    result_row["prior_year_month"] = prior_year_month
-                    result_row["prior_year_volume"] = prior_year_volume
-                    result_row["yoy_change_pct"] = self._calculate_yoy_change(
-                        forecast_value, prior_year_volume
+                if model_name == "snaive" and used_fallback:
+                    fallback_note = (
+                        f"SNAIVE used fallback (no same-month data for: "
+                        f"{target_date.strftime('%Y-%m')})"
                     )
-                results.append(result_row)
+                    model_note = f"{note}; {fallback_note}" if note else fallback_note
+                    logger.debug(fallback_note)
+
+                results.append(self._build_result_row(
+                    model_name, forecast_value, target_month,
+                    site_id, grade, months_available, data_quality,
+                    model_note, used_fallback, show_yoy,
+                    prior_year_month, prior_year_volume,
+                ))
             except Exception as e:
                 logger.warning(f"Prediction failed for {model_name}: {e}")
 
@@ -766,61 +849,123 @@ class FuelForecaster:
                 monthly_data, months_ahead, quality_note
             )
             forecasts_for_ensemble["FALLBACK"] = fallback_value
-            fallback_row = {
-                "model": "FALLBACK",
-                "target_month": target_month,
-                "forecast_volume": fallback_value,
-                "site_id": site_id or "ALL",
-                "grade": grade or "ALL",
-                "months_available": months_available,
-                "data_quality": data_quality,
-                "note": (note or "Using fallback due to model failure"),
-                "snaive_used_fallback": None,
-            }
-            # Add YoY columns if enabled
-            if show_yoy:
-                fallback_row["prior_year_month"] = prior_year_month
-                fallback_row["prior_year_volume"] = prior_year_volume
-                fallback_row["yoy_change_pct"] = self._calculate_yoy_change(
-                    fallback_value, prior_year_volume
-                )
-            results.append(fallback_row)
+            results.append(self._build_result_row(
+                "FALLBACK", fallback_value, target_month,
+                site_id, grade, months_available, data_quality,
+                note or "Using fallback due to model failure", False,
+                show_yoy, prior_year_month, prior_year_volume,
+            ))
 
         results_df = pd.DataFrame(results)
 
+        # Add ensemble row
         ensemble_note = note or ("Used fallback forecast" if fallback_value is not None else None)
-
-        # Add ensemble (weighted ETS/Snaive; robust fallback for other model sets)
         if forecasts_for_ensemble:
             ensemble_forecast = self._compute_ensemble_forecast(forecasts_for_ensemble)
-
-            # Check if any snaive result used fallback
             snaive_fallback_in_results = any(
                 r.get("snaive_used_fallback") for r in results if r.get("model") == "snaive"
             )
-
-            ensemble_row_data = {
-                "model": "ENSEMBLE",
-                "target_month": target_month,
-                "forecast_volume": ensemble_forecast,
-                "site_id": site_id or "ALL",
-                "grade": grade or "ALL",
-                "months_available": months_available,
-                "data_quality": data_quality,
-                "note": ensemble_note,
-                "snaive_used_fallback": snaive_fallback_in_results if snaive_fallback_in_results else None,
-            }
-            # Add YoY columns if enabled
-            if show_yoy:
-                ensemble_row_data["prior_year_month"] = prior_year_month
-                ensemble_row_data["prior_year_volume"] = prior_year_volume
-                ensemble_row_data["yoy_change_pct"] = self._calculate_yoy_change(
-                    ensemble_forecast, prior_year_volume
-                )
+            ensemble_row_data = self._build_result_row(
+                "ENSEMBLE", ensemble_forecast, target_month,
+                site_id, grade, months_available, data_quality,
+                ensemble_note, False,
+                show_yoy, prior_year_month, prior_year_volume,
+            )
+            # Propagate snaive fallback flag to the ENSEMBLE row so downstream
+            # consumers know the ensemble was influenced by a snaive fallback.
+            # _build_result_row sets this to None for non-snaive models, so we
+            # override it here when snaive actually used fallback.
+            ensemble_row_data["snaive_used_fallback"] = (
+                True if snaive_fallback_in_results else None
+            )
             ensemble_row = pd.DataFrame([ensemble_row_data])
             results_df = pd.concat([results_df, ensemble_row], ignore_index=True)
 
         return self._normalize_forecast_result_types(results_df)
+
+    # -- bulk forecasting helpers ---------------------------------------------
+
+    def _forecast_batch(
+        self,
+        items: pd.DataFrame,
+        target_month: str,
+        models_to_use: Optional[List[str]],
+        show_yoy: bool,
+        pya: Optional[Dict[Tuple[str, str], float]],
+        skip_insufficient: bool,
+        min_months_threshold: int,
+        log_every: int,
+        label: str,
+    ) -> Tuple[List[pd.DataFrame], List[Dict]]:
+        """Run generate_forecast for every row in *items* (site/grade combos).
+
+        Each row is expected to have at least 'site_id' and optionally 'grade'
+        and 'site'.  Returns (all_forecasts, skipped).
+        """
+        all_forecasts: List[pd.DataFrame] = []
+        skipped: List[Dict] = []
+        total = len(items)
+        has_grade = "grade" in items.columns
+
+        logger.info(f"Generating forecasts for {total} {label}")
+
+        for i, row in items.iterrows():
+            if (i + 1) % log_every == 0 or (i + 1) == total:
+                logger.info(f"  Progress: {i+1}/{total} {label}")
+
+            site_id = row.get("site_id")
+            grade = row.get("grade") if has_grade else None
+
+            try:
+                monthly_data = self.prepare_monthly_data(
+                    site_id=site_id, grade=grade, handle_outliers=True,
+                )
+                monthly_data_raw = self.prepare_monthly_data(
+                    site_id=site_id, grade=grade,
+                    handle_outliers=False, fill_gaps=False,
+                )
+                months_available = len(monthly_data_raw)
+
+                if months_available < min_months_threshold and skip_insufficient:
+                    skip_info: Dict[str, Any] = {"reason": f"Only {months_available} months"}
+                    if site_id:
+                        skip_info["site_id"] = site_id
+                        skip_info["site"] = row.get("site", "")
+                    if grade:
+                        skip_info["grade"] = grade
+                    skipped.append(skip_info)
+                    continue
+
+                forecast = self.generate_forecast(
+                    target_month,
+                    site_id=site_id,
+                    grade=grade,
+                    models_to_use=models_to_use,
+                    monthly_data=monthly_data,
+                    monthly_data_raw=monthly_data_raw,
+                    show_yoy=show_yoy,
+                    prior_year_actuals=pya,
+                )
+                all_forecasts.append(forecast)
+
+            except Exception as e:
+                parts = []
+                if site_id:
+                    parts.append(f"Site {site_id}")
+                if grade:
+                    parts.append(f"Grade {grade}")
+                logger.warning(f"  [x] {', '.join(parts) or label}: {e}")
+                err_info: Dict[str, Any] = {"reason": str(e)}
+                if site_id:
+                    err_info["site_id"] = site_id
+                    err_info["site"] = row.get("site", "")
+                if grade:
+                    err_info["grade"] = grade
+                skipped.append(err_info)
+
+        return all_forecasts, skipped
+
+    # -- main bulk entry point ------------------------------------------------
 
     def generate_bulk_forecasts(
         self,
@@ -845,9 +990,6 @@ class FuelForecaster:
         Returns:
             DataFrame with all forecasts
         """
-        all_forecasts = []
-        skipped = []
-
         # Precompute all prior-year actuals in one query for the entire run
         pya = self._precompute_prior_year_actuals(target_month) if show_yoy else None
 
@@ -855,7 +997,7 @@ class FuelForecaster:
             stats = self.db.get_summary_stats()
             raw_grades = stats.get("fuel_grades", [])
             grades = []
-            seen = set()
+            seen: set = set()
             for grade in raw_grades:
                 if pd.isna(grade):
                     continue
@@ -870,6 +1012,8 @@ class FuelForecaster:
 
             logger.info(f"Generating forecasts for {len(grades)} grades")
 
+            all_forecasts: List[pd.DataFrame] = []
+            skipped: List[Dict] = []
             for i, grade in enumerate(grades, 1):
                 logger.info(f"  [{i}/{len(grades)}] Grade: {grade}")
                 try:
@@ -883,115 +1027,20 @@ class FuelForecaster:
                     skipped.append({"grade": grade, "reason": str(e)})
 
         elif by == "site":
-            sites_df = self.db.get_distinct_sites()
-
-            total = len(sites_df)
-            logger.info(f"Generating forecasts for {total} sites")
-
-            for i, row in sites_df.iterrows():
-                if (i + 1) % 20 == 0 or (i + 1) == total:
-                    logger.info(f"  Progress: {i+1}/{total} sites")
-
-                try:
-                    # Cache monthly data - both processed (for ETS) and raw (for snaive)
-                    site_monthly_data = self.prepare_monthly_data(
-                        site_id=row["site_id"], handle_outliers=True
-                    )
-                    site_monthly_data_raw = self.prepare_monthly_data(
-                        site_id=row["site_id"], handle_outliers=False, fill_gaps=False
-                    )
-                    months_available = len(site_monthly_data_raw)
-
-                    if months_available < self.min_months_data and skip_insufficient:
-                        skipped.append(
-                            {
-                                "site_id": row["site_id"],
-                                "site": row["site"],
-                                "reason": f"Only {months_available} months",
-                            }
-                        )
-                        continue
-
-                    # Use cached data in bulk forecasts
-                    forecast = self.generate_forecast(
-                        target_month,
-                        site_id=row["site_id"],
-                        models_to_use=models_to_use,
-                        monthly_data=site_monthly_data,
-                        monthly_data_raw=site_monthly_data_raw,
-                        show_yoy=show_yoy,
-                        prior_year_actuals=pya,
-                    )
-                    all_forecasts.append(forecast)
-
-                except Exception as e:
-                    logger.warning(f"  [x] Site {row['site_id']}: {e}")
-                    skipped.append(
-                        {
-                            "site_id": row["site_id"],
-                            "site": row["site"],
-                            "reason": str(e),
-                        }
-                    )
-
-        elif by == "site_grade":
-            combos = self.db.get_distinct_site_grades()
-
-            total = len(combos)
-            logger.info(
-                f"Generating forecasts for {total} site-grade combinations"
+            items = self.db.get_distinct_sites()
+            all_forecasts, skipped = self._forecast_batch(
+                items, target_month, models_to_use, show_yoy, pya,
+                skip_insufficient, self.min_months_data,
+                log_every=20, label="sites",
             )
 
-            for i, row in combos.iterrows():
-                if (i + 1) % 50 == 0 or (i + 1) == total:
-                    logger.info(f"  Progress: {i+1}/{total} combinations")
-
-                try:
-                    # Cache monthly data - both processed (for ETS) and raw (for snaive)
-                    combo_monthly_data = self.prepare_monthly_data(
-                        site_id=row["site_id"], grade=row["grade"], handle_outliers=True
-                    )
-                    combo_monthly_data_raw = self.prepare_monthly_data(
-                        site_id=row["site_id"], grade=row["grade"], handle_outliers=False, fill_gaps=False
-                    )
-                    months_available = len(combo_monthly_data_raw)
-
-                    if months_available < self.soft_min_months and skip_insufficient:
-                        skipped.append(
-                            {
-                                "site_id": row["site_id"],
-                                "site": row["site"],
-                                "grade": row["grade"],
-                                "reason": f"Only {months_available} months",
-                            }
-                        )
-                        continue
-
-                    # Use cached data in bulk forecasts
-                    forecast = self.generate_forecast(
-                        target_month,
-                        site_id=row["site_id"],
-                        grade=row["grade"],
-                        models_to_use=models_to_use,
-                        monthly_data=combo_monthly_data,
-                        monthly_data_raw=combo_monthly_data_raw,
-                        show_yoy=show_yoy,
-                        prior_year_actuals=pya,
-                    )
-                    all_forecasts.append(forecast)
-
-                except Exception as e:
-                    logger.warning(
-                        f"  [x] Site {row['site_id']}, Grade {row['grade']}: {e}"
-                    )
-                    skipped.append(
-                        {
-                            "site_id": row["site_id"],
-                            "site": row["site"],
-                            "grade": row["grade"],
-                            "reason": str(e),
-                        }
-                    )
+        elif by == "site_grade":
+            items = self.db.get_distinct_site_grades()
+            all_forecasts, skipped = self._forecast_batch(
+                items, target_month, models_to_use, show_yoy, pya,
+                skip_insufficient, self.soft_min_months,
+                log_every=50, label="site-grade combinations",
+            )
 
         else:
             raise ValueError("by must be 'grade', 'site', or 'site_grade'")
@@ -999,19 +1048,16 @@ class FuelForecaster:
         if not all_forecasts:
             raise ValueError("No forecasts were successfully generated")
 
-        # Combine results
         valid_forecasts = [df for df in all_forecasts if not df.empty]
         if not valid_forecasts:
             raise ValueError("No non-empty forecast outputs were generated")
         combined = pd.concat(valid_forecasts, ignore_index=True)
 
-        # Log summary
         logger.info("\nForecast Summary:")
         logger.info(f"  [ok] Generated: {len(all_forecasts)} forecasts")
         if skipped:
             logger.info(f"  [skip] Skipped: {len(skipped)} items")
 
-        # Export to Excel
         if output_path:
             self._export_results(combined, skipped, output_path)
 
@@ -1088,20 +1134,10 @@ class FuelForecaster:
                 axis=1
             )
 
-        # Reorder columns for clarity
-        desired_order = [
-            "site_id",
-            "target_month",
-            "forecast_volume",
-            "prior_year_volume",
-            "yoy_change_pct",
-            "grades_included",
-        ]
-        ordered_cols = [c for c in desired_order if c in site_summary.columns]
-        remaining_cols = [c for c in site_summary.columns if c not in ordered_cols]
-        site_summary = site_summary[ordered_cols + remaining_cols]
-
-        return site_summary
+        return _reorder_columns(site_summary, [
+            "site_id", "target_month", "forecast_volume",
+            "prior_year_volume", "yoy_change_pct", "grades_included",
+        ])
 
     def _create_product_summary(self, forecasts: pd.DataFrame) -> pd.DataFrame:
         """
@@ -1171,21 +1207,10 @@ class FuelForecaster:
             axis=1
         )
 
-        # Reorder columns for clarity
-        desired_order = [
-            "grade",
-            "target_month",
-            "forecast_volume",
-            "prior_year_month",
-            "prior_year_volume",
-            "yoy_change_pct",
-            "sites_included",
-        ]
-        ordered_cols = [c for c in desired_order if c in product_summary.columns]
-        remaining_cols = [c for c in product_summary.columns if c not in ordered_cols]
-        product_summary = product_summary[ordered_cols + remaining_cols]
-
-        return product_summary
+        return _reorder_columns(product_summary, [
+            "grade", "target_month", "forecast_volume", "prior_year_month",
+            "prior_year_volume", "yoy_change_pct", "sites_included",
+        ])
 
     def _create_bu_summary(self, forecasts: pd.DataFrame) -> pd.DataFrame:
         """
@@ -1259,21 +1284,11 @@ class FuelForecaster:
             axis=1
         )
 
-        # Reorder columns for clarity
-        desired_order = [
-            "target_month",
-            "forecast_volume",
-            "prior_year_month",
-            "prior_year_volume",
-            "yoy_change_pct",
-            "sites_included",
+        return _reorder_columns(bu_summary, [
+            "target_month", "forecast_volume", "prior_year_month",
+            "prior_year_volume", "yoy_change_pct", "sites_included",
             "grades_included",
-        ]
-        ordered_cols = [c for c in desired_order if c in bu_summary.columns]
-        remaining_cols = [c for c in bu_summary.columns if c not in ordered_cols]
-        bu_summary = bu_summary[ordered_cols + remaining_cols]
-
-        return bu_summary
+        ])
 
     def _load_truck_stop_ids(self) -> List[str]:
         """Load truck stop site IDs from truck_stop_key.xlsx"""
@@ -1406,9 +1421,7 @@ class FuelForecaster:
                 )
 
             # Model Detail: all models with full diagnostic columns
-            detail_cols = [c for c in detail_order if c in forecasts.columns]
-            remaining_cols = [c for c in forecasts.columns if c not in detail_cols]
-            forecasts[detail_cols + remaining_cols].to_excel(
+            _reorder_columns(forecasts, list(detail_order)).to_excel(
                 writer, sheet_name="Model Detail", index=False
             )
 
@@ -1458,10 +1471,8 @@ class FuelForecaster:
                 logger.info(f"  -> Product Summary saved to: {product_summary_path}")
 
         # Model Detail: all models with full columns
-        detail_cols = [c for c in self.DETAIL_COLS if c in forecasts.columns]
-        remaining_cols = [c for c in forecasts.columns if c not in detail_cols]
         detail_path = base.with_name(f"{base.stem}_model_detail.csv")
-        forecasts[detail_cols + remaining_cols].to_csv(detail_path, index=False)
+        _reorder_columns(forecasts, list(self.DETAIL_COLS)).to_csv(detail_path, index=False)
         logger.info(f"  -> Model Detail saved to: {detail_path}")
 
         if skipped:

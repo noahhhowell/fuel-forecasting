@@ -33,6 +33,16 @@ MAPE_GOOD_THRESHOLD = 5
 MAPE_ACCEPTABLE_THRESHOLD = 10
 
 
+def _validate_backtest_params(months: int, min_months: int, horizon: int) -> None:
+    """Validate backtest configuration values."""
+    if months < 1:
+        raise ValueError("months must be >= 1")
+    if min_months < 1:
+        raise ValueError("min_months must be >= 1")
+    if horizon < 0:
+        raise ValueError("horizon must be >= 0")
+
+
 def get_actual_monthly_volume(db, site_id, month_str):
     """Get actual total volume for a site in a given month."""
     start = f"{month_str}-01"
@@ -128,24 +138,49 @@ def _parse_max_date(stats: dict) -> pd.Timestamp:
     return pd.to_datetime(date_range.split(" to ")[1])
 
 
-def run_backtest(db_path="fuel_sales.db", months=6, output=None, min_months=24, horizon=2):
-    if months < 1:
-        raise ValueError("months must be >= 1")
-    if min_months < 1:
-        raise ValueError("min_months must be >= 1")
-    if horizon < 0:
-        raise ValueError("horizon must be >= 0")
+def build_per_model_site_metrics(per_model_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build per-site per-model error metrics.
+
+    Returns columns: site_id, model, mape_pct, n_months
+    """
+    if per_model_df.empty:
+        return pd.DataFrame(columns=["site_id", "model", "mape_pct", "n_months"])
+
+    clean = per_model_df.copy()
+    clean["error_pct"] = pd.to_numeric(clean["error_pct"], errors="coerce")
+    clean = clean[np.isfinite(clean["error_pct"])].copy()
+    if clean.empty:
+        return pd.DataFrame(columns=["site_id", "model", "mape_pct", "n_months"])
+
+    return (
+        clean.groupby(["site_id", "model"])["error_pct"]
+        .agg(mape_pct="mean", n_months="count")
+        .reset_index()
+    )
+
+
+def run_backtest(db_path="fuel_sales.db", months=6, output=None, min_months=24,
+                 horizon=2, return_per_model=False):
+    _validate_backtest_params(months, min_months, horizon)
 
     db = FuelDatabase(db_path)
     try:
-        return _run_backtest_inner(db, months, output, min_months, horizon)
+        return _run_backtest_inner(db, months, output, min_months, horizon,
+                                   return_per_model=return_per_model)
     finally:
         db.close()
 
 
-def _run_backtest_inner(db, months, output, min_months, horizon):
+def _run_backtest_inner(db, months, output, min_months, horizon,
+                        return_per_model=False):
     """Core backtest logic, called inside a try/finally that guarantees db.close()."""
-    forecaster = FuelForecaster(db, min_months_data=min_months)
+    _validate_backtest_params(months, min_months, horizon)
+
+    # Disable adaptive weights during backtest to get clean, unbiased error
+    # measurements using fixed default weights.
+    forecaster = FuelForecaster(db, min_months_data=min_months,
+                                use_adaptive_weights=False)
 
     stats = db.get_summary_stats()
     if not stats.get("total_records"):
@@ -182,10 +217,13 @@ def _run_backtest_inner(db, months, output, min_months, horizon):
     print(f"Sites with >= {min_months} months of pre-test data: {len(qualified_sites)}")
     if not qualified_sites:
         print("No sites have enough data for backtesting.")
+        if return_per_model:
+            return None, None, None
         return None, None
 
     # Run forecasts for each site x test month
     results = []
+    per_model_results = []
     skipped_count = 0
     total_combos = len(qualified_sites) * len(test_months)
     done = 0
@@ -240,6 +278,25 @@ def _run_backtest_inner(db, months, output, min_months, horizon):
                     "error_pct": round(error_pct, 2),
                 })
 
+                # Collect per-model results when requested
+                if return_per_model:
+                    for _, row in forecast_df.iterrows():
+                        model_name = row["model"]
+                        if model_name in ("ENSEMBLE", "FALLBACK"):
+                            continue
+                        model_vol = float(row["forecast_volume"])
+                        model_error = abs(model_vol - actual) / actual * 100
+                        residual = (model_vol - actual) / actual
+                        per_model_results.append({
+                            "site_id": site_id,
+                            "month": target,
+                            "model": model_name,
+                            "forecast": round(model_vol, 1),
+                            "actual": round(actual, 1),
+                            "error_pct": round(model_error, 2),
+                            "residual": round(residual, 4),
+                        })
+
             except (ValueError, KeyError) as e:
                 # Expected data-related errors — count them so the user sees the skip rate
                 skipped_count += 1
@@ -258,9 +315,12 @@ def _run_backtest_inner(db, months, output, min_months, horizon):
 
     if not results:
         print("No results generated. Check that test months have actual data.")
+        if return_per_model:
+            return None, None, None
         return None, None
 
     results_df = pd.DataFrame(results)
+    per_model_df = pd.DataFrame(per_model_results) if return_per_model else None
 
     site_mape = build_site_error_metrics(results_df)
 
@@ -302,6 +362,8 @@ def _run_backtest_inner(db, months, output, min_months, horizon):
             site_mape.round(2).to_excel(writer, sheet_name="Site MAPE", index=False)
         print(f"\nSaved detail to: {output}")
 
+    if return_per_model:
+        return results_df, site_mape, per_model_df
     return results_df, site_mape
 
 

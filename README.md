@@ -1,6 +1,6 @@
 # Fuel Forecasting System
 
-Forecast gas station fuel volumes using ETS (Holt-Winters) and Seasonal Naive models with an ensemble median. Supports Excel/CSV ingest, SQLite storage, and Excel/CSV forecast exports.
+Forecast gas station fuel volumes using ETS (Holt-Winters) and Seasonal Naive models with a weighted ensemble (70% ETS, 30% Seasonal Naive). Supports Excel/CSV ingest, SQLite storage, and Excel/CSV forecast exports.
 
 ## Setup
 
@@ -117,7 +117,7 @@ python cli.py forecast 2026-03 --by site_grade --output detailed.xlsx
 
 - **ETS** (Holt-Winters): Exponential smoothing with trend and seasonality
 - **Seasonal Naive**: Uses same-month-last-year values
-- **ENSEMBLE**: Median of the above two. This is the recommended value for decisions.
+- **ENSEMBLE**: Weighted blend of the above two (70% ETS, 30% Seasonal Naive). This is the recommended value for decisions.
 
 ## Exporting Raw Data
 
@@ -220,12 +220,15 @@ python backtest.py --months 12 --output backtest_results.xlsx
 python backtest.py --horizon 3
 ```
 
-Holds out recent months, generates forecasts using only prior data, and reports MAPE (Mean Absolute Percentage Error) per site.
+Holds out recent months, generates forecasts using only prior data, and reports:
+- MAPE (mean absolute percentage error) per site
+- Median APE across all site-month rows
+- Trimmed MAPE (per-site mean after dropping each site's single worst month)
 
 ## Running Tests
 
 ```bash
-# Run the full test suite (53 tests, ~10 seconds)
+# Run the full test suite (~20 seconds)
 uv run pytest
 
 # Verbose output (see every test name)

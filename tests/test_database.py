@@ -159,3 +159,158 @@ class TestNullEstimated:
             assert len(df) == 1, "NULL is_estimated row should be included"
         finally:
             db.close()
+
+
+# ---------------------------------------------------------------------------
+# Calibration table CRUD
+# ---------------------------------------------------------------------------
+
+class TestCalibrationCRUD:
+    """Tests for calibration-related database methods."""
+
+    def test_save_and_get_calibration_run(self, db):
+        """Should save a calibration run and retrieve it."""
+        run_id = db.save_calibration_run({
+            "backtest_months": 12,
+            "horizon": 2,
+            "min_months": 24,
+            "sites_calibrated": 5,
+            "overall_mape": 7.5,
+        })
+        assert run_id is not None
+        assert run_id > 0
+
+        latest = db.get_latest_calibration_run()
+        assert latest is not None
+        assert latest["run_id"] == run_id
+        assert latest["backtest_months"] == 12
+        assert latest["overall_mape"] == 7.5
+
+    def test_save_and_get_site_weights(self, db):
+        """Should save weights and retrieve them in bulk."""
+        run_id = db.save_calibration_run({
+            "backtest_months": 6, "horizon": 2,
+            "min_months": 24, "sites_calibrated": 2, "overall_mape": 8.0,
+        })
+        weights = [
+            {"site_id": "100", "model_name": "ets", "weight": 0.65,
+             "mape_pct": 4.2, "n_months": 6},
+            {"site_id": "100", "model_name": "snaive", "weight": 0.35,
+             "mape_pct": 8.1, "n_months": 6},
+            {"site_id": "200", "model_name": "ets", "weight": 0.50,
+             "mape_pct": 6.0, "n_months": 6},
+            {"site_id": "200", "model_name": "snaive", "weight": 0.50,
+             "mape_pct": 6.0, "n_months": 6},
+        ]
+        rows_written = db.save_site_weights(run_id, weights)
+        assert rows_written == 4
+
+        bulk = db.get_site_weights_bulk()
+        assert "100" in bulk
+        assert bulk["100"]["ets"] == 0.65
+        assert bulk["100"]["snaive"] == 0.35
+        assert "200" in bulk
+
+    def test_save_and_get_interval_calibration(self, db):
+        """Should save and retrieve interval calibration factors."""
+        run_id = db.save_calibration_run({
+            "backtest_months": 6, "horizon": 2,
+            "min_months": 24, "sites_calibrated": 1, "overall_mape": 5.0,
+        })
+        segments = [
+            {"segment": "site:100", "residual_std": 0.08,
+             "residual_p10": -0.12, "residual_p90": 0.10, "n_observations": 12},
+            {"segment": "global", "residual_std": 0.10,
+             "residual_p10": -0.15, "residual_p90": 0.13, "n_observations": 50},
+        ]
+        db.save_interval_calibration(run_id, segments)
+
+        factors = db.get_interval_factors("site:100")
+        assert factors is not None
+        assert factors["residual_std"] == 0.08
+        assert factors["residual_p10"] == -0.12
+
+        global_f = db.get_interval_factors("global")
+        assert global_f is not None
+        assert global_f["n_observations"] == 50
+
+    def test_get_interval_factors_missing_returns_none(self, db):
+        """Missing segment should return None."""
+        assert db.get_interval_factors("site:nonexistent") is None
+
+    def test_get_latest_calibration_run_empty(self, tmp_path):
+        """Empty DB should return None for latest calibration."""
+        empty_db = FuelDatabase(str(tmp_path / "empty_cal.db"))
+        try:
+            assert empty_db.get_latest_calibration_run() is None
+        finally:
+            empty_db.close()
+
+    def test_site_weights_upsert(self, db):
+        """Saving weights for the same site should overwrite (upsert)."""
+        run_id = db.save_calibration_run({
+            "backtest_months": 6, "horizon": 2,
+            "min_months": 24, "sites_calibrated": 1, "overall_mape": 5.0,
+        })
+        db.save_site_weights(run_id, [
+            {"site_id": "100", "model_name": "ets", "weight": 0.60,
+             "mape_pct": 5.0, "n_months": 6},
+        ])
+        # Overwrite with new weight
+        db.save_site_weights(run_id, [
+            {"site_id": "100", "model_name": "ets", "weight": 0.80,
+             "mape_pct": 3.0, "n_months": 8},
+        ])
+        bulk = db.get_site_weights_bulk()
+        assert bulk["100"]["ets"] == 0.80
+
+    def test_get_site_weights_bulk_latest_run_only(self, db):
+        """Weight lookup should only return rows from the latest calibration run."""
+        run1 = db.save_calibration_run({
+            "backtest_months": 6, "horizon": 2,
+            "min_months": 24, "sites_calibrated": 1, "overall_mape": 6.0,
+        })
+        db.save_site_weights(run1, [
+            {"site_id": "100", "model_name": "ets", "weight": 0.75,
+             "mape_pct": 4.0, "n_months": 6},
+            {"site_id": "100", "model_name": "snaive", "weight": 0.25,
+             "mape_pct": 8.0, "n_months": 6},
+        ])
+
+        run2 = db.save_calibration_run({
+            "backtest_months": 3, "horizon": 2,
+            "min_months": 24, "sites_calibrated": 1, "overall_mape": 5.0,
+        })
+        db.save_site_weights(run2, [
+            {"site_id": "200", "model_name": "ets", "weight": 0.60,
+             "mape_pct": 5.0, "n_months": 3},
+            {"site_id": "200", "model_name": "snaive", "weight": 0.40,
+             "mape_pct": 6.0, "n_months": 3},
+        ])
+
+        bulk = db.get_site_weights_bulk()
+        assert "200" in bulk
+        assert "100" not in bulk
+
+    def test_get_interval_factors_latest_run_only(self, db):
+        """Interval lookup should only read factors from the latest run."""
+        run1 = db.save_calibration_run({
+            "backtest_months": 6, "horizon": 2,
+            "min_months": 24, "sites_calibrated": 1, "overall_mape": 6.0,
+        })
+        db.save_interval_calibration(run1, [
+            {"segment": "site:100", "residual_std": 0.08,
+             "residual_p10": -0.12, "residual_p90": 0.11, "n_observations": 10},
+        ])
+
+        run2 = db.save_calibration_run({
+            "backtest_months": 3, "horizon": 2,
+            "min_months": 24, "sites_calibrated": 1, "overall_mape": 5.0,
+        })
+        db.save_interval_calibration(run2, [
+            {"segment": "global", "residual_std": 0.10,
+             "residual_p10": -0.15, "residual_p90": 0.13, "n_observations": 20},
+        ])
+
+        assert db.get_interval_factors("site:100") is None
+        assert db.get_interval_factors("global") is not None

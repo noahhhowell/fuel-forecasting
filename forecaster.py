@@ -83,6 +83,10 @@ class FuelForecaster:
         "grade",
         "target_month",
         "forecast_volume",
+        "forecast_p10",
+        "forecast_p90",
+        "interval_width_pct",
+        "risk_flag",
         "prior_year_volume",
         "yoy_change_pct",
     )
@@ -92,37 +96,131 @@ class FuelForecaster:
         "target_month",
         "model",
         "forecast_volume",
+        "forecast_p10",
+        "forecast_p90",
+        "interval_width_pct",
+        "risk_flag",
         "prior_year_month",
         "prior_year_volume",
         "yoy_change_pct",
     )
 
-    def __init__(self, database, min_months_data: int = 24):
+    # Risk flag threshold: intervals wider than this % are flagged
+    RISK_THRESHOLD_PCT = 30.0
+
+    def __init__(self, database, min_months_data: int = 24,
+                 use_adaptive_weights: bool = True):
         """
         Initialize forecaster
 
         Args:
             database: FuelDatabase instance
             min_months_data: Minimum months of data required (default: 24)
+            use_adaptive_weights: Use calibrated per-site weights if available (default: True)
         """
         self.db = database
         self.min_months_data = min_months_data
         self.models = {}
         self.ensemble_weights = self.DEFAULT_ENSEMBLE_WEIGHTS.copy()
+        self.use_adaptive_weights = use_adaptive_weights
+        self._site_weights_cache = None
+        self._interval_cache = {}
         # Softer floor for sparse site/grade combos; allows forecasting with fewer months
         self.soft_min_months = max(
             SOFT_MIN_MONTHS_FLOOR, min(SOFT_MIN_MONTHS_CEIL, self.min_months_data)
         )
 
-    def _compute_ensemble_forecast(self, model_forecasts: Dict[str, float]) -> float:
-        """Compute a weighted ensemble with a robust fallback."""
+    def _load_site_weights(self) -> Dict[str, Dict[str, float]]:
+        """Lazy-load calibrated site weights from the database."""
+        if self._site_weights_cache is None:
+            if self.db is not None and self.use_adaptive_weights:
+                try:
+                    self._site_weights_cache = self.db.get_site_weights_bulk()
+                except Exception:
+                    self._site_weights_cache = {}
+            else:
+                self._site_weights_cache = {}
+        return self._site_weights_cache
+
+    def _get_interval_factors(self, segment: str) -> Optional[Dict]:
+        """Lookup interval factors with caching."""
+        if not self.use_adaptive_weights or self.db is None:
+            return None
+        if segment in self._interval_cache:
+            return self._interval_cache[segment]
+        try:
+            factors = self.db.get_interval_factors(segment)
+        except Exception:
+            factors = None
+        self._interval_cache[segment] = factors
+        return factors
+
+    def _compute_intervals(
+        self,
+        forecast: float,
+        site_id: Optional[str] = None,
+        grade: Optional[str] = None,
+        risk_threshold: float = None,
+    ) -> Dict[str, Any]:
+        """
+        Compute prediction intervals from calibrated residual distributions.
+
+        Shrinkage fallback: site -> grade -> global.
+        Returns dict with forecast_p10, forecast_p90, interval_width_pct, risk_flag.
+        Returns empty values if no calibration data exists.
+        """
+        if risk_threshold is None:
+            risk_threshold = self.RISK_THRESHOLD_PCT
+
+        factors = None
+        # Try site-level first
+        if site_id:
+            factors = self._get_interval_factors(f"site:{site_id}")
+        # Try grade-level
+        if factors is None and grade and grade != "ALL":
+            factors = self._get_interval_factors(f"grade:{grade}")
+        # Try global
+        if factors is None:
+            factors = self._get_interval_factors("global")
+
+        if factors is None:
+            return {
+                "forecast_p10": None,
+                "forecast_p90": None,
+                "interval_width_pct": None,
+                "risk_flag": None,
+            }
+
+        p10 = max(0.0, forecast * (1 + factors["residual_p10"]))
+        p90 = forecast * (1 + factors["residual_p90"])
+        width_pct = (p90 - p10) / forecast * 100 if forecast > 0 else None
+        risk_flag = "HIGH" if width_pct is not None and width_pct > risk_threshold else ""
+
+        return {
+            "forecast_p10": round(p10, 1),
+            "forecast_p90": round(p90, 1),
+            "interval_width_pct": round(width_pct, 1) if width_pct is not None else None,
+            "risk_flag": risk_flag,
+        }
+
+    def _compute_ensemble_forecast(
+        self, model_forecasts: Dict[str, float], site_id: Optional[str] = None
+    ) -> float:
+        """Compute a weighted ensemble with adaptive weights and robust fallback."""
         if not model_forecasts:
             raise ValueError("Cannot compute ensemble without model forecasts")
+
+        # Try site-specific calibrated weights
+        weights = self.ensemble_weights
+        if site_id and self.use_adaptive_weights:
+            site_weights = self._load_site_weights()
+            if site_id in site_weights:
+                weights = site_weights[site_id]
 
         weighted_sum = 0.0
         weight_total = 0.0
         for model_name, value in model_forecasts.items():
-            weight = self.ensemble_weights.get(model_name, 0.0)
+            weight = weights.get(model_name, 0.0)
             if weight > 0:
                 weighted_sum += weight * value
                 weight_total += weight
@@ -569,6 +667,11 @@ class FuelForecaster:
             ).astype("Float64")
         if "note" in df.columns:
             df["note"] = df["note"].astype("string")
+        for col in ("forecast_p10", "forecast_p90", "interval_width_pct"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").astype("Float64")
+        if "risk_flag" in df.columns:
+            df["risk_flag"] = df["risk_flag"].astype("string")
 
         return df
 
@@ -861,7 +964,9 @@ class FuelForecaster:
         # Add ensemble row
         ensemble_note = note or ("Used fallback forecast" if fallback_value is not None else None)
         if forecasts_for_ensemble:
-            ensemble_forecast = self._compute_ensemble_forecast(forecasts_for_ensemble)
+            ensemble_forecast = self._compute_ensemble_forecast(
+                forecasts_for_ensemble, site_id=site_id
+            )
             snaive_fallback_in_results = any(
                 r.get("snaive_used_fallback") for r in results if r.get("model") == "snaive"
             )
@@ -878,6 +983,13 @@ class FuelForecaster:
             ensemble_row_data["snaive_used_fallback"] = (
                 True if snaive_fallback_in_results else None
             )
+
+            # Compute prediction intervals for the ensemble
+            intervals = self._compute_intervals(
+                ensemble_forecast, site_id=site_id, grade=grade,
+            )
+            ensemble_row_data.update(intervals)
+
             ensemble_row = pd.DataFrame([ensemble_row_data])
             results_df = pd.concat([results_df, ensemble_row], ignore_index=True)
 
@@ -1357,8 +1469,11 @@ class FuelForecaster:
         # Map column names to Excel number formats
         formats = {
             "forecast_volume": "#,##0",
+            "forecast_p10": "#,##0",
+            "forecast_p90": "#,##0",
             "prior_year_volume": "#,##0",
             "yoy_change_pct": "0.0",
+            "interval_width_pct": "0.0",
             "sites_included": "#,##0",
             "grades_included": "#,##0",
             "months_available": "#,##0",

@@ -5,7 +5,7 @@ Database Module - SQLite operations with automatic deduplication
 import sqlite3
 import pandas as pd
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict
 import logging
 
 logger = logging.getLogger(__name__)
@@ -73,12 +73,50 @@ class FuelDatabase:
         )
         """
         
+        create_calibration_runs = """
+        CREATE TABLE IF NOT EXISTS calibration_runs (
+            run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            backtest_months INTEGER,
+            horizon INTEGER,
+            min_months INTEGER,
+            sites_calibrated INTEGER,
+            overall_mape REAL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+
+        create_calibration_weights = """
+        CREATE TABLE IF NOT EXISTS calibration_weights (
+            site_id TEXT NOT NULL,
+            model_name TEXT NOT NULL,
+            weight REAL NOT NULL,
+            mape_pct REAL,
+            n_months INTEGER,
+            run_id INTEGER NOT NULL REFERENCES calibration_runs(run_id),
+            PRIMARY KEY (site_id, model_name)
+        )
+        """
+
+        create_interval_calibration = """
+        CREATE TABLE IF NOT EXISTS interval_calibration (
+            segment TEXT NOT NULL PRIMARY KEY,
+            residual_std REAL NOT NULL,
+            residual_p10 REAL NOT NULL,
+            residual_p90 REAL NOT NULL,
+            n_observations INTEGER,
+            run_id INTEGER NOT NULL REFERENCES calibration_runs(run_id)
+        )
+        """
+
         with self.conn:
             self.conn.execute(create_sales)
             for idx in indexes:
                 self.conn.execute(idx)
             self.conn.execute(create_metadata)
-        
+            self.conn.execute(create_calibration_runs)
+            self.conn.execute(create_calibration_weights)
+            self.conn.execute(create_interval_calibration)
+
         logger.info(f"Database initialized: {self.db_path}")
 
     def load_from_excel(self, file_path: str) -> dict:
@@ -399,6 +437,122 @@ class FuelDatabase:
         ORDER BY site_id, grade
         """
         return pd.read_sql_query(query, self.conn)
+
+    # -- calibration methods ---------------------------------------------------
+
+    def save_calibration_run(self, params: Dict) -> int:
+        """Insert calibration run metadata, return run_id."""
+        sql = """
+        INSERT INTO calibration_runs
+            (backtest_months, horizon, min_months, sites_calibrated, overall_mape)
+        VALUES (?, ?, ?, ?, ?)
+        """
+        with self.conn:
+            cursor = self.conn.execute(sql, (
+                params.get("backtest_months"),
+                params.get("horizon"),
+                params.get("min_months"),
+                params.get("sites_calibrated"),
+                params.get("overall_mape"),
+            ))
+        return cursor.lastrowid
+
+    def save_site_weights(self, run_id: int, weights: List[Dict]) -> int:
+        """Bulk upsert site-level model weights. Returns rows written."""
+        sql = """
+        INSERT OR REPLACE INTO calibration_weights
+            (site_id, model_name, weight, mape_pct, n_months, run_id)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """
+        rows = [
+            (w["site_id"], w["model_name"], w["weight"],
+             w.get("mape_pct"), w.get("n_months"), run_id)
+            for w in weights
+        ]
+        with self.conn:
+            self.conn.executemany(sql, rows)
+        return len(rows)
+
+    def save_interval_calibration(self, run_id: int, segments: List[Dict]):
+        """Store residual distribution stats per segment."""
+        sql = """
+        INSERT OR REPLACE INTO interval_calibration
+            (segment, residual_std, residual_p10, residual_p90, n_observations, run_id)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """
+        rows = [
+            (s["segment"], s["residual_std"], s["residual_p10"],
+             s["residual_p90"], s.get("n_observations"), run_id)
+            for s in segments
+        ]
+        with self.conn:
+            self.conn.executemany(sql, rows)
+
+    def _get_latest_calibration_run_id(self) -> Optional[int]:
+        """Return the latest calibration run_id, or None if no runs exist."""
+        row = self.conn.execute(
+            "SELECT run_id FROM calibration_runs ORDER BY run_id DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return int(row[0])
+
+    def get_site_weights_bulk(self) -> Dict[str, Dict[str, float]]:
+        """Return latest-run site weights as {site_id: {model_name: weight}}."""
+        latest_run_id = self._get_latest_calibration_run_id()
+        if latest_run_id is None:
+            return {}
+
+        rows = self.conn.execute(
+            "SELECT site_id, model_name, weight "
+            "FROM calibration_weights "
+            "WHERE run_id = ?",
+            (latest_run_id,),
+        ).fetchall()
+        result: Dict[str, Dict[str, float]] = {}
+        for site_id, model_name, weight in rows:
+            result.setdefault(str(site_id), {})[str(model_name)] = float(weight)
+        return result
+
+    def get_interval_factors(self, segment: str) -> Optional[Dict]:
+        """Lookup residual distribution for a segment."""
+        latest_run_id = self._get_latest_calibration_run_id()
+        if latest_run_id is None:
+            return None
+
+        row = self.conn.execute(
+            "SELECT residual_std, residual_p10, residual_p90, n_observations "
+            "FROM interval_calibration "
+            "WHERE segment = ? AND run_id = ?",
+            (segment, latest_run_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "residual_std": row[0],
+            "residual_p10": row[1],
+            "residual_p90": row[2],
+            "n_observations": row[3],
+        }
+
+    def get_latest_calibration_run(self) -> Optional[Dict]:
+        """Return most recent calibration run metadata."""
+        row = self.conn.execute(
+            "SELECT run_id, backtest_months, horizon, min_months, "
+            "sites_calibrated, overall_mape, created_at "
+            "FROM calibration_runs ORDER BY run_id DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "run_id": row[0],
+            "backtest_months": row[1],
+            "horizon": row[2],
+            "min_months": row[3],
+            "sites_calibrated": row[4],
+            "overall_mape": row[5],
+            "created_at": row[6],
+        }
 
     def close(self):
         """Close database connection"""

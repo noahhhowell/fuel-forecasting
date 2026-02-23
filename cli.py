@@ -183,6 +183,30 @@ def export_command(args):
         db.close()
 
 
+def calibrate_command(args):
+    """Run calibration to learn per-site optimal weights and intervals"""
+    print("\n" + "=" * 60)
+    print("RUNNING CALIBRATION")
+    print("=" * 60)
+
+    from calibrate import run_calibration
+
+    run_id = run_calibration(
+        db_path=args.database,
+        months=args.months,
+        min_months=args.min_months,
+        horizon=args.horizon,
+        weight_floor=args.weight_floor,
+        output=args.output,
+    )
+
+    if run_id is not None:
+        print(f"\n[ok] Calibration stored (run_id={run_id})")
+    else:
+        print("\n[x] Calibration failed")
+        sys.exit(1)
+
+
 def forecast_command(args):
     """Generate forecasts"""
     print("\n" + "=" * 60)
@@ -190,7 +214,9 @@ def forecast_command(args):
     print("=" * 60)
 
     db = FuelDatabase(args.database)
-    forecaster = FuelForecaster(db, min_months_data=args.min_months)
+    use_adaptive = not getattr(args, "no_calibration", False)
+    forecaster = FuelForecaster(db, min_months_data=args.min_months,
+                                use_adaptive_weights=use_adaptive)
 
     try:
         # Generate forecast
@@ -272,6 +298,11 @@ Examples:
     python cli.py forecast 2026-01 --output jan_2026.xlsx  # With Excel export
     python cli.py forecast 2026-01 --by grade              # Forecast by fuel grade
     python cli.py forecast 2026-01 --by site_grade         # By site and grade
+    python cli.py forecast 2026-01 --no-calibration        # Force fixed 70/30 weights
+
+  Calibrate:
+    python cli.py calibrate                                # Learn optimal weights
+    python cli.py calibrate --months 12 --output cal.xlsx  # With report export
         """,
     )
 
@@ -353,6 +384,36 @@ Examples:
         help="Include sites with insufficient data",
     )
     forecast_parser.add_argument("--output", help="Output Excel file")
+    forecast_parser.add_argument(
+        "--no-calibration",
+        action="store_true",
+        help="Force fixed 70/30 weights and skip intervals",
+    )
+
+    # Calibrate command
+    calibrate_parser = subparsers.add_parser(
+        "calibrate", help="Learn per-site optimal weights and prediction intervals"
+    )
+    calibrate_parser.add_argument(
+        "--months", type=int, default=12,
+        help="Number of backtest months (default: 12)",
+    )
+    calibrate_parser.add_argument(
+        "--min-months", type=int, default=24,
+        help="Minimum months of pre-test data required (default: 24)",
+    )
+    calibrate_parser.add_argument(
+        "--horizon", type=int, default=2,
+        help="Forecast horizon in months ahead (default: 2)",
+    )
+    calibrate_parser.add_argument(
+        "--weight-floor", type=float, default=0.10,
+        help="Minimum weight per model (default: 0.10)",
+    )
+    calibrate_parser.add_argument(
+        "--output", type=str, default=None,
+        help="Save calibration report to Excel file",
+    )
 
     args = parser.parse_args()
 
@@ -369,6 +430,8 @@ Examples:
             export_command(args)
         elif args.command == "forecast":
             forecast_command(args)
+        elif args.command == "calibrate":
+            calibrate_command(args)
     except KeyboardInterrupt:
         print("\n\nInterrupted by user")
         sys.exit(1)

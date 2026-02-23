@@ -488,3 +488,156 @@ class TestEdgeCases:
         )
         assert not result.empty
         assert result["site_id"].nunique() == 1
+
+
+# ---------------------------------------------------------------------------
+# Adaptive weights and prediction intervals
+# ---------------------------------------------------------------------------
+
+class TestAdaptiveWeights:
+
+    def test_no_calibration_uses_default_weights(self, forecaster):
+        """Without calibration data, default 70/30 weights should be used."""
+        forecast = forecaster.generate_forecast(
+            target_month="2025-03", site_id="100", show_yoy=False,
+        )
+        individual = forecast.set_index("model")["forecast_volume"]
+        ensemble_vol = individual["ENSEMBLE"]
+        expected = (
+            individual["ets"] * 0.7 + individual["snaive"] * 0.3
+        )
+        assert ensemble_vol == pytest.approx(expected)
+
+    def test_adaptive_weights_used_when_calibrated(self, db):
+        """When calibration data exists, site-specific weights should be used."""
+        # Store calibration: site 100 gets 50/50
+        run_id = db.save_calibration_run({
+            "backtest_months": 6, "horizon": 2,
+            "min_months": 24, "sites_calibrated": 1, "overall_mape": 5.0,
+        })
+        db.save_site_weights(run_id, [
+            {"site_id": "100", "model_name": "ets", "weight": 0.50,
+             "mape_pct": 5.0, "n_months": 6},
+            {"site_id": "100", "model_name": "snaive", "weight": 0.50,
+             "mape_pct": 5.0, "n_months": 6},
+        ])
+
+        fc = FuelForecaster(db, min_months_data=24, use_adaptive_weights=True)
+        forecast = fc.generate_forecast(
+            target_month="2025-03", site_id="100", show_yoy=False,
+        )
+        individual = forecast.set_index("model")["forecast_volume"]
+        ensemble_vol = individual["ENSEMBLE"]
+        expected = (individual["ets"] * 0.50 + individual["snaive"] * 0.50)
+        assert ensemble_vol == pytest.approx(expected)
+
+    def test_no_calibration_flag_forces_defaults(self, db):
+        """use_adaptive_weights=False should ignore stored calibration."""
+        run_id = db.save_calibration_run({
+            "backtest_months": 6, "horizon": 2,
+            "min_months": 24, "sites_calibrated": 1, "overall_mape": 5.0,
+        })
+        db.save_site_weights(run_id, [
+            {"site_id": "100", "model_name": "ets", "weight": 0.50,
+             "mape_pct": 5.0, "n_months": 6},
+            {"site_id": "100", "model_name": "snaive", "weight": 0.50,
+             "mape_pct": 5.0, "n_months": 6},
+        ])
+
+        fc = FuelForecaster(db, min_months_data=24, use_adaptive_weights=False)
+        forecast = fc.generate_forecast(
+            target_month="2025-03", site_id="100", show_yoy=False,
+        )
+        individual = forecast.set_index("model")["forecast_volume"]
+        ensemble_vol = individual["ENSEMBLE"]
+        expected_default = (individual["ets"] * 0.7 + individual["snaive"] * 0.3)
+        assert ensemble_vol == pytest.approx(expected_default)
+
+
+class TestPredictionIntervals:
+
+    def test_intervals_null_without_calibration(self, forecaster):
+        """Without calibration data, interval columns should be null."""
+        forecast = forecaster.generate_forecast(
+            target_month="2025-03", site_id="100", show_yoy=False,
+        )
+        ensemble = forecast[forecast["model"] == "ENSEMBLE"].iloc[0]
+        assert pd.isna(ensemble.get("forecast_p10"))
+        assert pd.isna(ensemble.get("forecast_p90"))
+
+    def test_intervals_populated_with_calibration(self, db):
+        """With calibration data, intervals should be computed."""
+        run_id = db.save_calibration_run({
+            "backtest_months": 6, "horizon": 2,
+            "min_months": 24, "sites_calibrated": 1, "overall_mape": 5.0,
+        })
+        db.save_interval_calibration(run_id, [
+            {"segment": "site:100", "residual_std": 0.08,
+             "residual_p10": -0.10, "residual_p90": 0.12, "n_observations": 12},
+        ])
+
+        fc = FuelForecaster(db, min_months_data=24, use_adaptive_weights=True)
+        forecast = fc.generate_forecast(
+            target_month="2025-03", site_id="100", show_yoy=False,
+        )
+        ensemble = forecast[forecast["model"] == "ENSEMBLE"].iloc[0]
+        assert not pd.isna(ensemble["forecast_p10"])
+        assert not pd.isna(ensemble["forecast_p90"])
+        assert ensemble["forecast_p10"] < ensemble["forecast_volume"]
+        assert ensemble["forecast_p90"] > ensemble["forecast_volume"]
+
+    def test_interval_fallback_to_global(self, db):
+        """When site-level intervals are missing, should fall back to global."""
+        run_id = db.save_calibration_run({
+            "backtest_months": 6, "horizon": 2,
+            "min_months": 24, "sites_calibrated": 1, "overall_mape": 5.0,
+        })
+        db.save_interval_calibration(run_id, [
+            {"segment": "global", "residual_std": 0.10,
+             "residual_p10": -0.15, "residual_p90": 0.15, "n_observations": 50},
+        ])
+
+        fc = FuelForecaster(db, min_months_data=24, use_adaptive_weights=True)
+        forecast = fc.generate_forecast(
+            target_month="2025-03", site_id="100", show_yoy=False,
+        )
+        ensemble = forecast[forecast["model"] == "ENSEMBLE"].iloc[0]
+        assert not pd.isna(ensemble["forecast_p10"])
+
+    def test_risk_flag_high_for_wide_interval(self, db):
+        """Wide intervals should trigger HIGH risk flag."""
+        run_id = db.save_calibration_run({
+            "backtest_months": 6, "horizon": 2,
+            "min_months": 24, "sites_calibrated": 1, "overall_mape": 5.0,
+        })
+        # Very wide interval: -40% to +40%
+        db.save_interval_calibration(run_id, [
+            {"segment": "site:100", "residual_std": 0.30,
+             "residual_p10": -0.40, "residual_p90": 0.40, "n_observations": 12},
+        ])
+
+        fc = FuelForecaster(db, min_months_data=24, use_adaptive_weights=True)
+        forecast = fc.generate_forecast(
+            target_month="2025-03", site_id="100", show_yoy=False,
+        )
+        ensemble = forecast[forecast["model"] == "ENSEMBLE"].iloc[0]
+        assert ensemble["risk_flag"] == "HIGH"
+
+    def test_forecast_p10_non_negative(self, db):
+        """forecast_p10 should be clamped to 0 (volumes are non-negative)."""
+        run_id = db.save_calibration_run({
+            "backtest_months": 6, "horizon": 2,
+            "min_months": 24, "sites_calibrated": 1, "overall_mape": 5.0,
+        })
+        # Extreme negative residual that would make p10 negative
+        db.save_interval_calibration(run_id, [
+            {"segment": "site:100", "residual_std": 1.5,
+             "residual_p10": -2.0, "residual_p90": 0.50, "n_observations": 12},
+        ])
+
+        fc = FuelForecaster(db, min_months_data=24, use_adaptive_weights=True)
+        forecast = fc.generate_forecast(
+            target_month="2025-03", site_id="100", show_yoy=False,
+        )
+        ensemble = forecast[forecast["model"] == "ENSEMBLE"].iloc[0]
+        assert ensemble["forecast_p10"] >= 0

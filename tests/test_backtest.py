@@ -6,7 +6,9 @@ import pytest
 
 from backtest import (
     build_site_error_metrics,
+    build_per_model_site_metrics,
     run_backtest,
+    _run_backtest_inner,
     _parse_max_date,
     MAPE_GOOD_THRESHOLD,
     MAPE_ACCEPTABLE_THRESHOLD,
@@ -163,6 +165,12 @@ class TestRunBacktest:
         with pytest.raises(ValueError, match="min_months must be >= 1"):
             run_backtest(min_months=0)
 
+    def test_inner_invalid_months_raises(self, db):
+        with pytest.raises(ValueError, match="months must be >= 1"):
+            _run_backtest_inner(
+                db, months=0, output=None, min_months=12, horizon=1,
+            )
+
     def test_db_closed_on_error(self, tmp_path):
         """Database should be closed even if an error occurs during backtest."""
         bad_db = str(tmp_path / "empty.db")
@@ -173,3 +181,54 @@ class TestRunBacktest:
 
         with pytest.raises(RuntimeError, match="empty"):
             run_backtest(db_path=bad_db)
+
+    def test_return_per_model(self, db):
+        """return_per_model=True should return a 3-tuple with per-model data."""
+        result = run_backtest(
+            db_path=db.db_path, months=2, min_months=12, horizon=1,
+            return_per_model=True,
+        )
+        assert len(result) == 3
+        results_df, site_mape, per_model_df = result
+        assert results_df is not None
+        assert per_model_df is not None
+        assert not per_model_df.empty
+        assert {"site_id", "month", "model", "forecast", "actual",
+                "error_pct", "residual"}.issubset(per_model_df.columns)
+
+    def test_return_per_model_false_returns_pair(self, db):
+        """return_per_model=False (default) should return a 2-tuple."""
+        result = run_backtest(
+            db_path=db.db_path, months=2, min_months=12, horizon=1,
+            return_per_model=False,
+        )
+        assert len(result) == 2
+
+
+# ---------------------------------------------------------------------------
+# build_per_model_site_metrics
+# ---------------------------------------------------------------------------
+
+class TestBuildPerModelSiteMetrics:
+
+    def test_groups_by_site_and_model(self):
+        """Should produce one row per (site_id, model) pair."""
+        df = pd.DataFrame([
+            {"site_id": "100", "model": "ets", "error_pct": 5.0},
+            {"site_id": "100", "model": "ets", "error_pct": 7.0},
+            {"site_id": "100", "model": "snaive", "error_pct": 10.0},
+            {"site_id": "200", "model": "ets", "error_pct": 3.0},
+        ])
+        metrics = build_per_model_site_metrics(df)
+        assert len(metrics) == 3
+        assert {"site_id", "model", "mape_pct", "n_months"}.issubset(metrics.columns)
+
+        ets_100 = metrics[(metrics["site_id"] == "100") & (metrics["model"] == "ets")]
+        assert ets_100["mape_pct"].iloc[0] == pytest.approx(6.0)
+        assert ets_100["n_months"].iloc[0] == 2
+
+    def test_empty_input(self):
+        """Empty input should return empty DataFrame with correct schema."""
+        metrics = build_per_model_site_metrics(pd.DataFrame())
+        assert metrics.empty
+        assert "mape_pct" in metrics.columns

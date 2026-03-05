@@ -89,14 +89,14 @@ python cli.py status --detailed
 ## Generating Forecasts
 
 ```bash
-# Basic forecast (by site, printed to console)
+# Basic forecast (printed to console)
 python cli.py forecast 2026-03
 
 # Save to Excel
-python cli.py forecast 2026-03 --by site --output forecasts/2026-03_site.xlsx
+python cli.py forecast 2026-03 --output forecasts/2026-03.xlsx
 
 # Save to CSV
-python cli.py forecast 2026-03 --by site --output forecasts/2026-03_site.csv
+python cli.py forecast 2026-03 --output forecasts/2026-03.csv
 ```
 
 If calibration has been run, forecasts automatically use the calibrated per-site weights. To force the default fixed weights instead, add `--no-calibration`:
@@ -105,25 +105,10 @@ If calibration has been run, forecasts automatically use the calibrated per-site
 python cli.py forecast 2026-03 --no-calibration
 ```
 
-### Forecast Levels
-
-| Level | What it does | Output rows |
-|-------|--------------|-------------|
-| `grade` | One forecast per fuel grade (UNL, PRE, DSL) | 3 x #grades |
-| `site` | One forecast per site, all grades combined | 3 x #sites |
-| `site_grade` | One forecast per site-grade combination | 3 x #combos |
-
-```bash
-python cli.py forecast 2026-03 --by grade --output grades.xlsx
-python cli.py forecast 2026-03 --by site --output sites.xlsx
-python cli.py forecast 2026-03 --by site_grade --output detailed.xlsx
-```
-
 ### Forecast Options
 
 | Flag | What it does |
 |------|--------------|
-| `--by` | Aggregation level: `grade`, `site`, `site_grade` (default: `site`) |
 | `--output` | Save to Excel (.xlsx) or CSV (.csv) |
 | `--model ets` | Use only ETS model |
 | `--model snaive` | Use only Seasonal Naive model |
@@ -216,8 +201,8 @@ python cli.py export --output with_estimated.csv --include-estimated
 |-------|----------|
 | Forecasts | ENSEMBLE results only. Columns: `site_id, grade, target_month, forecast_volume, prior_year_volume, yoy_change_pct` |
 | BU Total | One-row grand total with YoY % |
-| Site Summary | Site totals from summing grades (only for `--by site_grade`) |
-| Product Summary | Grade-level aggregation with YoY % (only for `--by site_grade`) |
+| Site Summary | Site totals from summing grades |
+| Product Summary | Grade-level aggregation with YoY % |
 | Model Detail | All models (ets, snaive, ENSEMBLE) with full diagnostic columns |
 | Skipped | Sites skipped due to insufficient data |
 
@@ -225,8 +210,8 @@ python cli.py export --output with_estimated.csv --include-estimated
 
 Main file has ENSEMBLE results only. Companion files are created alongside:
 - `<name>_bu_total.csv`
-- `<name>_site_summary.csv` (only for `--by site_grade`)
-- `<name>_product_summary.csv` (only for `--by site_grade`)
+- `<name>_site_summary.csv`
+- `<name>_product_summary.csv`
 - `<name>_model_detail.csv`
 - `<name>_skipped.csv`
 
@@ -267,7 +252,7 @@ python cli.py status --detailed
 python cli.py calibrate --output calibration_report.xlsx
 
 # 4. Generate forecasts (uses calibrated weights automatically)
-python cli.py forecast 2026-04 --by site --output forecasts/2026-04_site.xlsx
+python cli.py forecast 2026-04 --output forecasts/2026-04.xlsx
 ```
 
 ### Weekly data update workflow
@@ -280,7 +265,7 @@ python cli.py load --file data/FuelVolume_2026_H1.xlsx
 python cli.py status
 
 # 3. Generate forecast (calibrated weights from last run are still active)
-python cli.py forecast 2026-04 --by site --output forecasts/2026-04_site.xlsx
+python cli.py forecast 2026-04 --output forecasts/2026-04.xlsx
 ```
 
 ### Re-calibrate after loading several months of new data
@@ -289,20 +274,14 @@ python cli.py forecast 2026-04 --by site --output forecasts/2026-04_site.xlsx
 python cli.py calibrate --months 12 --output calibration_report.xlsx
 ```
 
-### Detailed site-grade forecasts
-
-```bash
-python cli.py forecast 2026-03 --by site_grade --output forecasts/2026-03_detailed.xlsx
-```
-
 ### Include sites with limited data
 
 ```bash
 # Lower the threshold to 12 months
-python cli.py forecast 2026-03 --by site --min-months 12 --output forecasts/lenient.xlsx
+python cli.py forecast 2026-03 --min-months 12 --output forecasts/lenient.xlsx
 
 # Or include everything regardless
-python cli.py forecast 2026-03 --by site --include-all --output forecasts/all.xlsx
+python cli.py forecast 2026-03 --include-all --output forecasts/all.xlsx
 ```
 
 ## Running Tests
@@ -325,11 +304,7 @@ Tests use temporary databases with synthetic data — they don't touch `fuel_sal
 
 ## Expected Runtimes
 
-| Level | Approximate time |
-|-------|-----------------|
-| `grade` | Under 1 minute |
-| `site` (~400 sites) | 5-10 minutes |
-| `site_grade` (~1,200 combos) | 15-30 minutes |
+Forecasts are generated per site-grade combination. For ~1,200 combos, expect 15-30 minutes.
 
 ## Best Practices
 
@@ -358,10 +333,10 @@ Install Python 3.9+ from python.org, then retry.
 python cli.py status --detailed
 
 # Lower the threshold
-python cli.py forecast 2026-03 --by site --min-months 12
+python cli.py forecast 2026-03 --min-months 12
 
 # Or include all sites
-python cli.py forecast 2026-03 --by site --include-all
+python cli.py forecast 2026-03 --include-all
 ```
 
 ### "months must be >= 1" or similar validation errors

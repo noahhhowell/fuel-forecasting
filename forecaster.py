@@ -43,9 +43,9 @@ SPIKE_MULTIPLIER = 8
 LEVEL_SHIFT_MIN_TRAILING = 3
 
 # Asymmetric MAD bounds for outlier detection.  The lower bound is tighter
-# (4×MAD) because near-zero months are almost always errors (system outages,
+# (4x MAD) because near-zero months are almost always errors (system outages,
 # store closures misrecorded as zero sales).  The upper bound is looser
-# (6×MAD) because legitimate upside surprises (new customer, promo) are more
+# (6x MAD) because legitimate upside surprises (new customer, promo) are more
 # common than downside errors.
 MAD_LOWER_MULTIPLIER = 4.0
 MAD_UPPER_MULTIPLIER = 6.0
@@ -176,7 +176,7 @@ class FuelForecaster:
         # Try site-level first
         if site_id:
             factors = self._get_interval_factors(f"site:{site_id}")
-        # Try grade-level
+        # Try grade-level fallback if that segment exists
         if factors is None and grade and grade != "ALL":
             factors = self._get_interval_factors(f"grade:{grade}")
         # Try global
@@ -374,7 +374,7 @@ class FuelForecaster:
     # -- outlier sub-routines --------------------------------------------------
 
     def _detect_spikes(self, df: pd.DataFrame, site_label: str) -> pd.DataFrame:
-        """Cap single-month volume spikes that exceed SPIKE_MULTIPLIER × rolling median."""
+        """Cap single-month volume spikes that exceed SPIKE_MULTIPLIER x rolling median."""
         if len(df) < 4:
             return df
 
@@ -912,7 +912,7 @@ class FuelForecaster:
         if models_to_use is None:
             models_to_use = list(available_models.keys())
 
-        # Generate predictions — train each model with appropriate data
+        # Generate predictions - train each model with appropriate data
         results = []
         forecasts_for_ensemble: Dict[str, float] = {}
         note = quality_note
@@ -1082,7 +1082,6 @@ class FuelForecaster:
     def generate_bulk_forecasts(
         self,
         target_month: str,
-        by: str = "site",
         models_to_use: Optional[List[str]] = None,
         output_path: Optional[str] = None,
         skip_insufficient: bool = True,
@@ -1093,9 +1092,8 @@ class FuelForecaster:
 
         Args:
             target_month: Target month 'YYYY-MM'
-            by: 'grade', 'site', or 'site_grade'
             models_to_use: Specific models to use
-            output_path: Output Excel file path
+            output_path: Output Excel or CSV file path
             skip_insufficient: Skip items with insufficient data
             show_yoy: Include year-over-year comparison columns (default: True)
 
@@ -1105,57 +1103,12 @@ class FuelForecaster:
         # Precompute all prior-year actuals in one query for the entire run
         pya = self._precompute_prior_year_actuals(target_month) if show_yoy else None
 
-        if by == "grade":
-            stats = self.db.get_summary_stats()
-            raw_grades = stats.get("fuel_grades", [])
-            grades = []
-            seen: set = set()
-            for grade in raw_grades:
-                if pd.isna(grade):
-                    continue
-                grade_value = str(grade).strip()
-                if not grade_value or grade_value in seen:
-                    continue
-                seen.add(grade_value)
-                grades.append(grade_value)
-
-            if not grades:
-                raise ValueError("No valid fuel grades found in database")
-
-            logger.info(f"Generating forecasts for {len(grades)} grades")
-
-            all_forecasts: List[pd.DataFrame] = []
-            skipped: List[Dict] = []
-            for i, grade in enumerate(grades, 1):
-                logger.info(f"  [{i}/{len(grades)}] Grade: {grade}")
-                try:
-                    forecast = self.generate_forecast(
-                        target_month, grade=grade, models_to_use=models_to_use,
-                        show_yoy=show_yoy, prior_year_actuals=pya,
-                    )
-                    all_forecasts.append(forecast)
-                except Exception as e:
-                    logger.warning(f"  [x] Failed: {e}")
-                    skipped.append({"grade": grade, "reason": str(e)})
-
-        elif by == "site":
-            items = self.db.get_distinct_sites()
-            all_forecasts, skipped = self._forecast_batch(
-                items, target_month, models_to_use, show_yoy, pya,
-                skip_insufficient, self.min_months_data,
-                log_every=20, label="sites",
-            )
-
-        elif by == "site_grade":
-            items = self.db.get_distinct_site_grades()
-            all_forecasts, skipped = self._forecast_batch(
-                items, target_month, models_to_use, show_yoy, pya,
-                skip_insufficient, self.soft_min_months,
-                log_every=50, label="site-grade combinations",
-            )
-
-        else:
-            raise ValueError("by must be 'grade', 'site', or 'site_grade'")
+        items = self.db.get_distinct_site_grades()
+        all_forecasts, skipped = self._forecast_batch(
+            items, target_month, models_to_use, show_yoy, pya,
+            skip_insufficient, self.soft_min_months,
+            log_every=50, label="site-grade combinations",
+        )
 
         if not all_forecasts:
             raise ValueError("No forecasts were successfully generated")
@@ -1194,7 +1147,7 @@ class FuelForecaster:
         Only applicable when forecasts contain grade-level detail.
 
         Args:
-            forecasts: DataFrame with site_grade level forecasts
+            forecasts: DataFrame with site-grade detail
 
         Returns:
             DataFrame with site-level totals derived from summing grades
@@ -1426,7 +1379,7 @@ class FuelForecaster:
         """
         Create Truck Stops sheet: truck stop site IDs with their DSL forecast volume.
 
-        Only populated when forecasts contain grade-level detail (--by site_grade).
+        Only populated when forecasts contain grade-level detail.
         """
         has_grade_detail = "grade" in forecasts.columns and (forecasts["grade"] != "ALL").any()
         if not has_grade_detail:
@@ -1509,7 +1462,7 @@ class FuelForecaster:
             if not bu_summary.empty:
                 bu_summary.to_excel(writer, sheet_name="BU Total", index=False)
 
-            # Product Summary & Site Summary: only for site_grade
+            # Product Summary & Site Summary: only when grade detail exists
             if has_grade_detail:
                 product_summary = self._create_product_summary(forecasts)
                 if not product_summary.empty:
@@ -1571,7 +1524,7 @@ class FuelForecaster:
             bu_summary.to_csv(bu_path, index=False)
             logger.info(f"  -> BU Total saved to: {bu_path}")
 
-        # Site Summary and Product Summary: only for site_grade
+        # Site Summary and Product Summary: only when grade detail exists
         if has_grade_detail:
             site_summary = self._create_site_summary(forecasts)
             if not site_summary.empty:
@@ -1595,3 +1548,4 @@ class FuelForecaster:
             skipped_path = base.with_name(f"{base.stem}_skipped.csv")
             skipped_df.to_csv(skipped_path, index=False)
             logger.info(f"  -> Skipped items saved to: {skipped_path}")
+

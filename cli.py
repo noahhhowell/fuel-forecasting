@@ -222,7 +222,6 @@ def forecast_command(args):
         # Generate forecast
         forecast = forecaster.generate_bulk_forecasts(
             target_month=args.month,
-            by=args.by,
             models_to_use=[args.model] if args.model else None,
             output_path=args.output,
             skip_insufficient=not args.include_all,
@@ -233,33 +232,25 @@ def forecast_command(args):
         print("FORECAST SUMMARY")
         print("=" * 60)
 
-        if args.by in ["site", "site_grade"]:
-            # Show counts
-            unique_sites = forecast["site_id"].nunique()
-            print(f"\nForecasts generated for {unique_sites} sites")
+        # Show counts for the current site-grade bulk mode
+        unique_sites = forecast["site_id"].nunique()
+        ensemble = forecast[forecast["model"] == "ENSEMBLE"]
+        combo_count = len(ensemble) if not ensemble.empty else 0
+        print(
+            f"\nGenerated {combo_count} site-grade forecasts across {unique_sites} sites"
+        )
 
-            # Show top/bottom forecasts
-            ensemble = forecast[forecast["model"] == "ENSEMBLE"]
-            if not ensemble.empty:
-                print("\nTop 5 highest forecasts:")
-                top5 = ensemble.nlargest(5, "forecast_volume")[
-                    ["site_id", "grade", "forecast_volume"]
-                ]
-                for _, row in top5.iterrows():
-                    grade_str = f" - {row['grade']}" if row["grade"] != "ALL" else ""
-                    print(
-                        f"  {row['site_id']}{grade_str}: {row['forecast_volume']:,.0f} gallons"
-                    )
-
-        else:
-            # Grade-level: show all models per grade
-            ensemble = forecast[forecast["model"] == "ENSEMBLE"]
-            if not ensemble.empty:
-                print("\nForecast by Grade:")
-                for _, row in ensemble.iterrows():
-                    print(
-                        f"  {row['grade']:10s}: {row['forecast_volume']:>15,.2f} gallons"
-                    )
+        # Show top forecasts
+        if not ensemble.empty:
+            print("\nTop 5 highest forecasts:")
+            top5 = ensemble.nlargest(5, "forecast_volume")[
+                ["site_id", "grade", "forecast_volume"]
+            ]
+            for _, row in top5.iterrows():
+                grade_str = f" - {row['grade']}" if row["grade"] != "ALL" else ""
+                print(
+                    f"  {row['site_id']}{grade_str}: {row['forecast_volume']:,.0f} gallons"
+                )
 
         if args.output:
             print(f"\n[ok] Exported to: {args.output}")
@@ -294,10 +285,9 @@ Examples:
     python cli.py export --output unl.csv --grade UNL
 
   Generate forecast:
-    python cli.py forecast 2026-01                         # Forecasts by site (default)
-    python cli.py forecast 2026-01 --output jan_2026.xlsx  # With Excel export
-    python cli.py forecast 2026-01 --by grade              # Forecast by fuel grade
-    python cli.py forecast 2026-01 --by site_grade         # By site and grade
+    python cli.py forecast 2026-01                         # Forecast all site-grade combos
+    python cli.py forecast 2026-01 --output jan_2026.xlsx  # Save to Excel
+    python cli.py forecast 2026-01 --output jan_2026.csv   # Save to CSV
     python cli.py forecast 2026-01 --no-calibration        # Force fixed 70/30 weights
 
   Calibrate:
@@ -362,12 +352,6 @@ Examples:
     forecast_parser = subparsers.add_parser("forecast", help="Generate forecast")
     forecast_parser.add_argument("month", help="Target month (YYYY-MM)")
     forecast_parser.add_argument(
-        "--by",
-        choices=["grade", "site", "site_grade"],
-        default="site",
-        help="Aggregation level (default: site)",
-    )
-    forecast_parser.add_argument(
         "--model",
         choices=["ets", "snaive"],
         help="Use specific model only",
@@ -383,7 +367,7 @@ Examples:
         action="store_true",
         help="Include sites with insufficient data",
     )
-    forecast_parser.add_argument("--output", help="Output Excel file")
+    forecast_parser.add_argument("--output", help="Output Excel or CSV file")
     forecast_parser.add_argument(
         "--no-calibration",
         action="store_true",

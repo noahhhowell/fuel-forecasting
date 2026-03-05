@@ -298,12 +298,12 @@ def _run_backtest_inner(db, months, output, min_months, horizon,
                         })
 
             except (ValueError, KeyError) as e:
-                # Expected data-related errors — count them so the user sees the skip rate
+                # Expected data-related errors - count them so the user sees the skip rate
                 skipped_count += 1
                 logger.info(f"Skipped site {site_id}, month {target}: {e}")
                 continue
             except Exception as e:
-                # Unexpected errors — log at warning so they surface
+                # Unexpected errors - log at warning so they surface
                 skipped_count += 1
                 logger.warning(f"Site {site_id}, month {target}: {e}")
                 continue
@@ -404,3 +404,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

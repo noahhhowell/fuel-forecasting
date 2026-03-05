@@ -112,6 +112,44 @@ def _compute_residual_stats(residuals):
     }
 
 
+def _compute_ensemble_residuals(per_model_df, weights_lookup):
+    """
+    Compute ensemble residuals using calibrated weights.
+
+    For each (site, month), blends per-model forecasts with their calibrated
+    weights, then computes residual = (ensemble - actual) / actual.
+
+    Returns a DataFrame with columns: site_id, month, residual.
+    """
+    columns = ["site_id", "month", "residual"]
+    if per_model_df is None or per_model_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    records = []
+    grouped = per_model_df.groupby(["site_id", "month"])
+    for (site_id, month), group in grouped:
+        ensemble_vol = 0.0
+        total_weight = 0.0
+        actual = None
+        for _, row in group.iterrows():
+            w = weights_lookup.get((row["site_id"], row["model"]), 0.0)
+            forecast = row["forecast"]
+            if not np.isfinite(forecast):
+                continue
+            ensemble_vol += w * forecast
+            total_weight += w
+            actual = row["actual"]
+
+        if total_weight > 0 and actual is not None and np.isfinite(actual) and actual > 0:
+            ensemble_vol /= total_weight
+            records.append({
+                "site_id": site_id,
+                "month": month,
+                "residual": (ensemble_vol - actual) / actual,
+            })
+    return pd.DataFrame(records, columns=columns)
+
+
 def run_calibration(db_path="fuel_sales.db", months=12, min_months=24,
                     horizon=2, weight_floor=WEIGHT_FLOOR, output=None):
     """
@@ -195,20 +233,33 @@ def _run_calibration_inner(db, months, min_months, horizon, weight_floor, output
             })
 
     # -- Step 3: Interval calibration (residual distributions) --
+    # Compute ensemble residuals using the calibrated weights, rather than
+    # pooling raw per-model residuals (which would inflate intervals for
+    # models with high error but low weight).
+    weights_lookup = {
+        (r["site_id"], r["model_name"]): r["weight"]
+        for r in weight_records
+    }
+    ensemble_residuals = _compute_ensemble_residuals(per_model_df, weights_lookup)
+    if ensemble_residuals.empty:
+        logger.warning("No ensemble residuals produced; skipping interval calibration.")
+
     segments = []
 
     # Per-site residuals
-    for site_id in per_model_df["site_id"].unique():
-        site_residuals = per_model_df[
-            per_model_df["site_id"] == site_id
+    for site_id in ensemble_residuals["site_id"].unique():
+        site_resid = ensemble_residuals[
+            ensemble_residuals["site_id"] == site_id
         ]["residual"].values
-        stats = _compute_residual_stats(site_residuals)
+        stats = _compute_residual_stats(site_resid)
         if stats:
             stats["segment"] = f"site:{site_id}"
             segments.append(stats)
 
     # Global residuals
-    global_stats = _compute_residual_stats(per_model_df["residual"].values)
+    global_stats = _compute_residual_stats(
+        ensemble_residuals["residual"].values
+    )
     if global_stats:
         global_stats["segment"] = "global"
         segments.append(global_stats)

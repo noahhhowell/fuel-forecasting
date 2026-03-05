@@ -13,7 +13,7 @@
 - Help and options: `uv run python cli.py --help` or `uv run python cli.py forecast --help`.
 - Load data: `uv run python cli.py load --file data/latest.xlsx` (CSV also supported).
 - Health check: `uv run python cli.py status --detailed` to see coverage and gaps.
-- Forecast: `uv run python cli.py forecast 2026-01 --by site_grade --output forecasts/jan_2026.xlsx` (swap `--by` level as needed).
+- Forecast: `uv run python cli.py forecast 2026-01 --output forecasts/jan_2026.xlsx`.
 - Calibrate: `uv run python cli.py calibrate` to learn per-site weights. Add `--output cal.xlsx` for a report.
 - Backtest: `uv run python backtest.py --months 12` to evaluate accuracy over the last 12 months.
 - Run tests: `uv run pytest` (full suite, ~20s). Use `uv run pytest tests/ -v` for verbose or `uv run pytest -k "keyword"` to filter.

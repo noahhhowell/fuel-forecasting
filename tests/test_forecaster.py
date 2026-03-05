@@ -282,34 +282,10 @@ class TestYoYCalculation:
 
 class TestBulkForecasts:
 
-    def test_bulk_by_site(self, forecaster):
-        """Bulk by-site should produce forecasts for both test sites."""
+    def test_bulk_forecasts(self, forecaster):
+        """Bulk forecasts should produce per-site-per-grade forecasts."""
         result = forecaster.generate_bulk_forecasts(
             target_month="2025-03",
-            by="site",
-            show_yoy=False,
-        )
-        assert not result.empty
-        sites = result["site_id"].unique()
-        # The fixture has 2 sites; both should appear
-        assert len(sites) == 2
-
-    def test_bulk_by_grade(self, forecaster):
-        """Bulk by-grade should produce forecasts for UNL and DSL."""
-        result = forecaster.generate_bulk_forecasts(
-            target_month="2025-03",
-            by="grade",
-            show_yoy=False,
-        )
-        assert not result.empty
-        grades = result["grade"].unique()
-        assert set(grades) >= {"UNL", "DSL"}
-
-    def test_bulk_by_site_grade(self, forecaster):
-        """Bulk by-site_grade should produce per-site-per-grade forecasts."""
-        result = forecaster.generate_bulk_forecasts(
-            target_month="2025-03",
-            by="site_grade",
             show_yoy=False,
         )
         assert not result.empty
@@ -317,21 +293,14 @@ class TestBulkForecasts:
         combos = ensemble.groupby("site_id")["grade"].nunique()
         assert (combos >= 2).all()
 
-    def test_invalid_by_raises(self, forecaster):
-        """Invalid 'by' parameter should raise ValueError."""
-        with pytest.raises(ValueError, match="must be"):
-            forecaster.generate_bulk_forecasts(
-                target_month="2025-03", by="invalid"
-            )
-
     def test_bulk_ensemble_count_matches_items(self, forecaster):
-        """Number of ENSEMBLE rows should equal number of items forecast."""
+        """Number of ENSEMBLE rows should equal number of site-grade combos in DB."""
         result = forecaster.generate_bulk_forecasts(
-            target_month="2025-03", by="site", show_yoy=False,
+            target_month="2025-03", show_yoy=False,
         )
         ensemble_count = (result["model"] == "ENSEMBLE").sum()
-        sites = result["site_id"].unique()
-        assert ensemble_count == len(sites)
+        expected = len(forecaster.db.get_distinct_site_grades())
+        assert ensemble_count == expected
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +313,6 @@ class TestSummarySheets:
         """Helper: generate site_grade forecasts for summary testing."""
         return forecaster.generate_bulk_forecasts(
             target_month="2025-03",
-            by="site_grade",
             show_yoy=True,
         )
 
@@ -405,7 +373,6 @@ class TestExport:
         """Excel export should create a file with expected sheets."""
         forecasts = forecaster.generate_bulk_forecasts(
             target_month="2025-03",
-            by="site_grade",
             show_yoy=True,
         )
         output = str(tmp_path / "test_output.xlsx")
@@ -419,7 +386,6 @@ class TestExport:
         """CSV export should create the main file."""
         forecasts = forecaster.generate_bulk_forecasts(
             target_month="2025-03",
-            by="site",
             show_yoy=False,
         )
         output = str(tmp_path / "test_output.csv")
@@ -483,7 +449,7 @@ class TestEdgeCases:
     def test_single_site_bulk(self, sparse_forecaster):
         """Bulk forecast with a single site should still succeed."""
         result = sparse_forecaster.generate_bulk_forecasts(
-            target_month="2025-03", by="site", show_yoy=False,
+            target_month="2025-03", show_yoy=False,
             skip_insufficient=False,
         )
         assert not result.empty

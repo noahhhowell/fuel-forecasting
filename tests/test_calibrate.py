@@ -5,9 +5,12 @@ Tests for calibrate.py — weight computation, shrinkage, and interval calibrati
 import numpy as np
 import pytest
 
+import pandas as pd
+
 from calibrate import (
     compute_optimal_weights,
     _blend_weights,
+    _compute_ensemble_residuals,
     _compute_residual_stats,
     run_calibration,
     WEIGHT_FLOOR,
@@ -136,6 +139,67 @@ class TestResidualStats:
         stats = _compute_residual_stats(residuals)
         assert stats is not None
         assert stats["n_observations"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Ensemble residuals
+# ---------------------------------------------------------------------------
+
+class TestComputeEnsembleResiduals:
+
+    def _make_per_model_df(self):
+        """Two models, two months, one site. Actual=100 each month."""
+        return pd.DataFrame([
+            {"site_id": "S1", "month": "2025-01", "model": "ets",
+             "forecast": 110.0, "actual": 100.0, "error_pct": 10.0, "residual": 0.10},
+            {"site_id": "S1", "month": "2025-01", "model": "snaive",
+             "forecast": 90.0, "actual": 100.0, "error_pct": 10.0, "residual": -0.10},
+            {"site_id": "S1", "month": "2025-02", "model": "ets",
+             "forecast": 105.0, "actual": 100.0, "error_pct": 5.0, "residual": 0.05},
+            {"site_id": "S1", "month": "2025-02", "model": "snaive",
+             "forecast": 95.0, "actual": 100.0, "error_pct": 5.0, "residual": -0.05},
+        ])
+
+    def test_equal_weights_gives_zero_residual(self):
+        """Equal weights on symmetric forecasts should produce ~0 residual."""
+        df = self._make_per_model_df()
+        weights = {("S1", "ets"): 0.5, ("S1", "snaive"): 0.5}
+        result = _compute_ensemble_residuals(df, weights)
+        assert len(result) == 2
+        # (0.5*110 + 0.5*90) = 100, residual = 0
+        assert result["residual"].iloc[0] == pytest.approx(0.0)
+        assert result["residual"].iloc[1] == pytest.approx(0.0)
+
+    def test_high_weight_on_overforecast_gives_positive_residual(self):
+        """Weighting the over-forecasting model more should give positive residual."""
+        df = self._make_per_model_df()
+        weights = {("S1", "ets"): 0.8, ("S1", "snaive"): 0.2}
+        result = _compute_ensemble_residuals(df, weights)
+        # Month 1: (0.8*110 + 0.2*90)/1.0 = 106, residual = 0.06
+        assert result["residual"].iloc[0] == pytest.approx(0.06)
+
+    def test_missing_weight_excluded(self):
+        """Model with no weight entry (weight=0) should not contribute."""
+        df = self._make_per_model_df()
+        # Only ets has a weight; snaive missing from lookup → weight=0
+        weights = {("S1", "ets"): 1.0}
+        result = _compute_ensemble_residuals(df, weights)
+        # ensemble = ets only → 110/100 - 1 = 0.10
+        assert result["residual"].iloc[0] == pytest.approx(0.10)
+
+    def test_returns_one_row_per_site_month(self):
+        """Should collapse per-model rows into one ensemble row per site-month."""
+        df = self._make_per_model_df()
+        weights = {("S1", "ets"): 0.6, ("S1", "snaive"): 0.4}
+        result = _compute_ensemble_residuals(df, weights)
+        assert len(result) == 2
+        assert list(result.columns) == ["site_id", "month", "residual"]
+
+    def test_empty_input_preserves_expected_columns(self):
+        """Empty inputs should return an empty frame with the stable schema."""
+        result = _compute_ensemble_residuals(pd.DataFrame(), {})
+        assert result.empty
+        assert list(result.columns) == ["site_id", "month", "residual"]
 
 
 # ---------------------------------------------------------------------------

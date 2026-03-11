@@ -55,6 +55,29 @@ DEGENERATE_LOWER_FACTOR = 0.5
 DEGENERATE_UPPER_FACTOR = 2.0
 
 
+# ---------------------------------------------------------------------------
+# Post-forecast sanity caps & YoY guardrails
+# ---------------------------------------------------------------------------
+
+# Sites with fewer than this many months of data use grade-cohort bounds
+# instead of their own history for sanity caps.
+MATURE_SITE_MONTHS = 12
+
+# Sanity cap multipliers applied to the reference max/min volume.
+SANITY_CAP_UPPER_MULT = 3.0
+SANITY_CAP_LOWER_MULT = 0.1
+
+# When extrapolating trend for new sites, the extrapolated value itself
+# is capped at this multiple of the most recent actual volume before the
+# SANITY_CAP_UPPER_MULT multiplier is applied.
+TREND_EXTRAP_CEILING_MULT = 2.0
+
+# Year-over-year guardrails: forecast must stay within these ratios of
+# the prior-year same-month actual.
+YOY_GUARD_UPPER_RATIO = 3.0
+YOY_GUARD_LOWER_RATIO = 0.33
+
+
 def _normalize_filter(value: Optional[str]) -> Optional[str]:
     """Coerce empty/whitespace-only strings to None for site_id / grade filters."""
     if isinstance(value, str) and value.strip() == "":
@@ -83,6 +106,11 @@ class FuelForecaster:
         "grade",
         "target_month",
         "forecast_volume",
+        "forecast_volume_unclamped",
+        "sanity_cap_applied",
+        "upper_cap_value",
+        "lower_floor_value",
+        "yoy_cap_applied",
         "forecast_p10",
         "forecast_p90",
         "interval_width_pct",
@@ -96,6 +124,11 @@ class FuelForecaster:
         "target_month",
         "model",
         "forecast_volume",
+        "forecast_volume_unclamped",
+        "sanity_cap_applied",
+        "upper_cap_value",
+        "lower_floor_value",
+        "yoy_cap_applied",
         "forecast_p10",
         "forecast_p90",
         "interval_width_pct",
@@ -673,6 +706,14 @@ class FuelForecaster:
         if "risk_flag" in df.columns:
             df["risk_flag"] = df["risk_flag"].astype("string")
 
+        # Sanity-cap columns
+        for col in ("forecast_volume_unclamped", "upper_cap_value", "lower_floor_value"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").astype("Float64")
+        for col in ("sanity_cap_applied", "yoy_cap_applied"):
+            if col in df.columns:
+                df[col] = df[col].astype("string")
+
         return df
 
     def check_data_sufficiency(
@@ -810,6 +851,7 @@ class FuelForecaster:
         show_yoy: bool,
         prior_year_month: Optional[str],
         prior_year_volume: Optional[float],
+        site: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Build a single result-row dict, optionally including YoY columns."""
         row: Dict[str, Any] = {
@@ -823,6 +865,8 @@ class FuelForecaster:
             "note": note,
             "snaive_used_fallback": used_fallback if model_name == "snaive" else None,
         }
+        if site is not None:
+            row["site"] = site
         if show_yoy:
             row["prior_year_month"] = prior_year_month
             row["prior_year_volume"] = prior_year_volume
@@ -843,6 +887,7 @@ class FuelForecaster:
         monthly_data_raw: Optional[pd.DataFrame] = None,
         show_yoy: bool = True,
         prior_year_actuals: Optional[Dict[Tuple[str, str], float]] = None,
+        site: Optional[str] = None,
     ) -> pd.DataFrame:
         """
         Generate forecast for a specific month
@@ -943,6 +988,7 @@ class FuelForecaster:
                     site_id, grade, months_available, data_quality,
                     model_note, used_fallback, show_yoy,
                     prior_year_month, prior_year_volume,
+                    site=site,
                 ))
             except Exception as e:
                 logger.warning(f"Prediction failed for {model_name}: {e}")
@@ -957,6 +1003,7 @@ class FuelForecaster:
                 site_id, grade, months_available, data_quality,
                 note or "Using fallback due to model failure", False,
                 show_yoy, prior_year_month, prior_year_volume,
+                site=site,
             ))
 
         results_df = pd.DataFrame(results)
@@ -975,6 +1022,7 @@ class FuelForecaster:
                 site_id, grade, months_available, data_quality,
                 ensemble_note, False,
                 show_yoy, prior_year_month, prior_year_volume,
+                site=site,
             )
             # Propagate snaive fallback flag to the ENSEMBLE row so downstream
             # consumers know the ensemble was influenced by a snaive fallback.
@@ -995,6 +1043,248 @@ class FuelForecaster:
 
         return self._normalize_forecast_result_types(results_df)
 
+    # -- post-forecast sanity caps & guardrails --------------------------------
+
+    def _precompute_sanity_bounds(self) -> Dict[tuple, Dict[str, Any]]:
+        """Precompute per-(site_id, grade) sanity cap bounds.
+
+        Mature sites (>=MATURE_SITE_MONTHS months) use their own history.
+        New sites use grade-cohort stats from mature sites.
+
+        Returns:
+            {(site_id, grade): {"upper_cap": float, "lower_floor": float, "is_mature": bool}}
+        """
+        cohort_stats = self.db.get_grade_cohort_stats()
+        site_stats = self.db.get_site_monthly_stats()
+
+        bounds: Dict[tuple, Dict[str, Any]] = {}
+        for (site_id, grade), stats in site_stats.items():
+            is_mature = stats["months_count"] >= MATURE_SITE_MONTHS
+            if is_mature and stats["site_monthly_max"] > 0:
+                upper = SANITY_CAP_UPPER_MULT * stats["site_monthly_max"]
+                lower = SANITY_CAP_LOWER_MULT * stats["site_monthly_min"] if stats["site_monthly_min"] > 0 else 0.0
+            elif grade in cohort_stats and cohort_stats[grade]["cohort_monthly_max"] > 0:
+                upper = SANITY_CAP_UPPER_MULT * cohort_stats[grade]["cohort_monthly_max"]
+                lower = SANITY_CAP_LOWER_MULT * cohort_stats[grade]["cohort_monthly_min"] if cohort_stats[grade]["cohort_monthly_min"] > 0 else 0.0
+            else:
+                # No cohort data available — skip capping
+                upper = float("inf")
+                lower = 0.0
+
+            bounds[(site_id, grade)] = {
+                "upper_cap": upper,
+                "lower_floor": lower,
+                "is_mature": is_mature,
+            }
+
+        return bounds
+
+    def _apply_sanity_caps(
+        self,
+        forecast_value: float,
+        site_id: str,
+        grade: str,
+        bounds: Dict[tuple, Dict[str, Any]],
+        monthly_data_raw: Optional[pd.DataFrame],
+    ) -> Tuple[float, float, str, float, float]:
+        """Clamp *forecast_value* to precomputed sanity bounds.
+
+        For new (non-mature) sites with >=3 months of data, the upper cap
+        is widened using trend extrapolation so that legitimately ramping
+        sites aren't neutered.
+
+        Returns:
+            (capped_value, unclamped_value, label, upper_cap_value, lower_floor_value)
+        """
+        key = (str(site_id), str(grade))
+        info = bounds.get(key)
+        if info is None:
+            return forecast_value, forecast_value, "", float("inf"), 0.0
+
+        upper_cap = info["upper_cap"]
+        lower_floor = info["lower_floor"]
+
+        # Trend-aware widening for new sites
+        if not info["is_mature"] and monthly_data_raw is not None and len(monthly_data_raw) >= 3:
+            recent = monthly_data_raw.tail(min(6, len(monthly_data_raw)))
+            try:
+                x = np.arange(len(recent))
+                slope = float(np.polyfit(x, recent["volume"].values, 1)[0])
+                if slope > 0:
+                    months_ahead = len(monthly_data_raw)  # rough extrapolation distance
+                    extrapolated = float(recent["volume"].iloc[-1]) + slope * months_ahead
+                    most_recent = float(recent["volume"].iloc[-1])
+                    # Cap extrapolation at TREND_EXTRAP_CEILING_MULT * most recent
+                    extrapolated = min(extrapolated, TREND_EXTRAP_CEILING_MULT * most_recent)
+                    trend_upper = SANITY_CAP_UPPER_MULT * extrapolated
+                    if trend_upper > upper_cap:
+                        upper_cap = trend_upper
+            except Exception:
+                pass
+
+        unclamped = forecast_value
+        label = ""
+        if forecast_value > upper_cap:
+            forecast_value = upper_cap
+            label = "upper_cap"
+        elif forecast_value < lower_floor:
+            forecast_value = lower_floor
+            label = "lower_floor"
+
+        return forecast_value, unclamped, label, upper_cap, lower_floor
+
+    def _apply_yoy_guardrails(
+        self, forecast_value: float, prior_year_volume: Optional[float]
+    ) -> Tuple[float, str]:
+        """Clamp forecast to YoY guardrail range.
+
+        Skipped entirely when *prior_year_volume* is None or <= 0.
+
+        Returns:
+            (capped_value, label)
+        """
+        if prior_year_volume is None or pd.isna(prior_year_volume) or prior_year_volume <= 0:
+            return forecast_value, ""
+
+        upper = prior_year_volume * YOY_GUARD_UPPER_RATIO
+        lower = prior_year_volume * YOY_GUARD_LOWER_RATIO
+
+        if forecast_value > upper:
+            return upper, "yoy_upper"
+        if forecast_value < lower:
+            return lower, "yoy_lower"
+        return forecast_value, ""
+
+    def _apply_caps_to_forecast_df(
+        self,
+        forecast_df: pd.DataFrame,
+        sanity_bounds: Dict[tuple, Dict[str, Any]],
+        monthly_data_raw: Optional[pd.DataFrame],
+    ) -> pd.DataFrame:
+        """Apply sanity caps and YoY guardrails to ENSEMBLE rows in *forecast_df*."""
+        df = forecast_df.copy()
+
+        # Initialize new columns with defaults
+        df["forecast_volume_unclamped"] = df["forecast_volume"]
+        df["sanity_cap_applied"] = ""
+        df["upper_cap_value"] = pd.NA
+        df["lower_floor_value"] = pd.NA
+        df["yoy_cap_applied"] = ""
+
+        ensemble_mask = df["model"] == "ENSEMBLE"
+        for idx in df.index[ensemble_mask]:
+            row = df.loc[idx]
+            site_id = str(row["site_id"])
+            grade = str(row["grade"])
+            vol = float(row["forecast_volume"])
+
+            # Sanity caps
+            vol, unclamped, sanity_label, upper_val, lower_val = self._apply_sanity_caps(
+                vol, site_id, grade, sanity_bounds, monthly_data_raw,
+            )
+            df.at[idx, "forecast_volume"] = vol
+            df.at[idx, "forecast_volume_unclamped"] = unclamped
+            df.at[idx, "sanity_cap_applied"] = sanity_label
+            df.at[idx, "upper_cap_value"] = upper_val if np.isfinite(upper_val) else pd.NA
+            df.at[idx, "lower_floor_value"] = lower_val
+
+            # YoY guardrails
+            prior_year_vol = row.get("prior_year_volume")
+            if prior_year_vol is not None and not pd.isna(prior_year_vol):
+                vol_after_yoy, yoy_label = self._apply_yoy_guardrails(vol, float(prior_year_vol))
+                if yoy_label:
+                    df.at[idx, "forecast_volume"] = vol_after_yoy
+                    df.at[idx, "yoy_cap_applied"] = yoy_label
+                    # Recalculate YoY change after capping
+                    if "yoy_change_pct" in df.columns:
+                        df.at[idx, "yoy_change_pct"] = self._calculate_yoy_change(
+                            vol_after_yoy, prior_year_vol
+                        )
+            else:
+                df.at[idx, "yoy_cap_applied"] = ""
+
+            # If any cap fired, clip p10/p90 to the effective bounds
+            final_vol = float(df.at[idx, "forecast_volume"])
+            if final_vol != unclamped:
+                for pcol in ("forecast_p10", "forecast_p90"):
+                    if pcol in df.columns and pd.notna(df.at[idx, pcol]):
+                        pval = float(df.at[idx, pcol])
+                        # Clip p10/p90 so they don't exceed the cap
+                        if upper_val and np.isfinite(upper_val):
+                            pval = min(pval, upper_val)
+                        pval = max(pval, lower_val)
+                        df.at[idx, pcol] = pval
+                # Recalculate interval width
+                if (
+                    "forecast_p10" in df.columns
+                    and "forecast_p90" in df.columns
+                    and pd.notna(df.at[idx, "forecast_p10"])
+                    and pd.notna(df.at[idx, "forecast_p90"])
+                    and final_vol > 0
+                ):
+                    p10 = float(df.at[idx, "forecast_p10"])
+                    p90 = float(df.at[idx, "forecast_p90"])
+                    df.at[idx, "interval_width_pct"] = (p90 - p10) / final_vol * 100
+
+        return df
+
+    def _create_review_sheet(self, forecasts: pd.DataFrame) -> pd.DataFrame:
+        """Create a Review sheet highlighting forecasts that need human attention.
+
+        Includes ENSEMBLE rows where any of: sanity/yoy cap applied,
+        sparse/very_sparse data quality, or HIGH risk flag.
+        """
+        if "model" not in forecasts.columns:
+            return pd.DataFrame()
+
+        ensemble = forecasts[forecasts["model"] == "ENSEMBLE"].copy()
+        if ensemble.empty:
+            return pd.DataFrame()
+
+        # Build mask for rows needing review
+        mask = pd.Series(False, index=ensemble.index)
+
+        if "sanity_cap_applied" in ensemble.columns:
+            mask |= ensemble["sanity_cap_applied"].fillna("").astype(str).ne("")
+        if "yoy_cap_applied" in ensemble.columns:
+            mask |= ensemble["yoy_cap_applied"].fillna("").astype(str).ne("")
+        if "data_quality" in ensemble.columns:
+            mask |= ensemble["data_quality"].isin(("sparse", "very_sparse"))
+        if "risk_flag" in ensemble.columns:
+            mask |= ensemble["risk_flag"].astype(str).eq("HIGH")
+
+        review = ensemble.loc[mask].copy()
+        if review.empty:
+            return pd.DataFrame()
+
+        # Sort by severity: capped > very_sparse > sparse > HIGH risk only
+        def _severity(row):
+            sanity = row.get("sanity_cap_applied", "")
+            yoy = row.get("yoy_cap_applied", "")
+            # pd.NA or None → treat as empty
+            sanity = "" if pd.isna(sanity) else str(sanity)
+            yoy = "" if pd.isna(yoy) else str(yoy)
+            if sanity != "" or yoy != "":
+                return 0
+            if row.get("data_quality") == "very_sparse":
+                return 1
+            if row.get("data_quality") == "sparse":
+                return 2
+            return 3  # HIGH risk only
+
+        review["_severity"] = review.apply(_severity, axis=1)
+        review = review.sort_values("_severity").drop(columns=["_severity"])
+
+        # Select columns for the review sheet
+        review_cols = [
+            "site_id", "site", "grade", "data_quality", "months_available",
+            "forecast_volume", "forecast_volume_unclamped",
+            "sanity_cap_applied", "upper_cap_value", "lower_floor_value",
+            "yoy_cap_applied", "risk_flag", "interval_width_pct", "note",
+        ]
+        available = [c for c in review_cols if c in review.columns]
+        return review[available].reset_index(drop=True)
+
     # -- bulk forecasting helpers ---------------------------------------------
 
     def _forecast_batch(
@@ -1008,6 +1298,7 @@ class FuelForecaster:
         min_months_threshold: int,
         log_every: int,
         label: str,
+        sanity_bounds: Optional[Dict[tuple, Dict[str, Any]]] = None,
     ) -> Tuple[List[pd.DataFrame], List[Dict]]:
         """Run generate_forecast for every row in *items* (site/grade combos).
 
@@ -1027,6 +1318,7 @@ class FuelForecaster:
 
             site_id = row.get("site_id")
             grade = row.get("grade") if has_grade else None
+            site_name = row.get("site")
 
             try:
                 monthly_data = self.prepare_monthly_data(
@@ -1057,7 +1349,15 @@ class FuelForecaster:
                     monthly_data_raw=monthly_data_raw,
                     show_yoy=show_yoy,
                     prior_year_actuals=pya,
+                    site=site_name,
                 )
+
+                # Apply sanity caps and YoY guardrails
+                if sanity_bounds is not None:
+                    forecast = self._apply_caps_to_forecast_df(
+                        forecast, sanity_bounds, monthly_data_raw,
+                    )
+
                 all_forecasts.append(forecast)
 
             except Exception as e:
@@ -1103,11 +1403,15 @@ class FuelForecaster:
         # Precompute all prior-year actuals in one query for the entire run
         pya = self._precompute_prior_year_actuals(target_month) if show_yoy else None
 
+        # Precompute sanity bounds once for the entire run
+        sanity_bounds = self._precompute_sanity_bounds()
+
         items = self.db.get_distinct_site_grades()
         all_forecasts, skipped = self._forecast_batch(
             items, target_month, models_to_use, show_yoy, pya,
             skip_insufficient, self.soft_min_months,
             log_every=50, label="site-grade combinations",
+            sanity_bounds=sanity_bounds,
         )
 
         if not all_forecasts:
@@ -1422,6 +1726,9 @@ class FuelForecaster:
         # Map column names to Excel number formats
         formats = {
             "forecast_volume": "#,##0",
+            "forecast_volume_unclamped": "#,##0",
+            "upper_cap_value": "#,##0",
+            "lower_floor_value": "#,##0",
             "forecast_p10": "#,##0",
             "forecast_p90": "#,##0",
             "prior_year_volume": "#,##0",
@@ -1488,6 +1795,11 @@ class FuelForecaster:
                     writer, sheet_name="Truck Stops", index=False
                 )
 
+            # Review: flagged forecasts needing human attention
+            review = self._create_review_sheet(forecasts)
+            if not review.empty:
+                review.to_excel(writer, sheet_name="Review", index=False)
+
             # Model Detail: all models with full diagnostic columns
             _reorder_columns(forecasts, list(detail_order)).to_excel(
                 writer, sheet_name="Model Detail", index=False
@@ -1537,6 +1849,13 @@ class FuelForecaster:
                 product_summary_path = base.with_name(f"{base.stem}_product_summary.csv")
                 product_summary.to_csv(product_summary_path, index=False)
                 logger.info(f"  -> Product Summary saved to: {product_summary_path}")
+
+        # Review: flagged forecasts
+        review = self._create_review_sheet(forecasts)
+        if not review.empty:
+            review_path = base.with_name(f"{base.stem}_review.csv")
+            review.to_csv(review_path, index=False)
+            logger.info(f"  -> Review saved to: {review_path}")
 
         # Model Detail: all models with full columns
         detail_path = base.with_name(f"{base.stem}_model_detail.csv")

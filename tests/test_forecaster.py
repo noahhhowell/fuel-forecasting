@@ -12,7 +12,17 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from forecaster import FuelForecaster, _normalize_filter, _reorder_columns
+from forecaster import (
+    FuelForecaster,
+    _normalize_filter,
+    _reorder_columns,
+    SANITY_CAP_UPPER_MULT,
+    SANITY_CAP_LOWER_MULT,
+    YOY_GUARD_UPPER_RATIO,
+    YOY_GUARD_LOWER_RATIO,
+    TREND_EXTRAP_CEILING_MULT,
+    MATURE_SITE_MONTHS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -607,3 +617,273 @@ class TestPredictionIntervals:
         )
         ensemble = forecast[forecast["model"] == "ENSEMBLE"].iloc[0]
         assert ensemble["forecast_p10"] >= 0
+
+
+# ---------------------------------------------------------------------------
+# Sanity caps & YoY guardrails
+# ---------------------------------------------------------------------------
+
+class TestSanityCaps:
+
+    def _make_forecaster(self):
+        """Create a standalone FuelForecaster with no database."""
+        return FuelForecaster(database=None, min_months_data=24)
+
+    def _make_monthly_data(self, volumes):
+        """Build a simple monthly DataFrame for testing."""
+        return pd.DataFrame({
+            "date": pd.date_range("2024-01", periods=len(volumes), freq="MS"),
+            "volume": [float(v) for v in volumes],
+        })
+
+    def test_mature_site_upper_cap(self):
+        """24-month site whose forecast exceeds 3x max should be capped."""
+        fc = self._make_forecaster()
+        bounds = {
+            ("S1", "UNL"): {
+                "upper_cap": SANITY_CAP_UPPER_MULT * 1000,  # 3000
+                "lower_floor": SANITY_CAP_LOWER_MULT * 200,  # 20
+                "is_mature": True,
+            }
+        }
+        raw = self._make_monthly_data([500] * 24)
+        capped, unclamped, label, upper, lower = fc._apply_sanity_caps(
+            5000.0, "S1", "UNL", bounds, raw,
+        )
+        assert capped == 3000.0
+        assert unclamped == 5000.0
+        assert label == "upper_cap"
+
+    def test_mature_site_lower_floor(self):
+        """Forecast below 0.1x min should be floored."""
+        fc = self._make_forecaster()
+        bounds = {
+            ("S1", "UNL"): {
+                "upper_cap": 3000.0,
+                "lower_floor": SANITY_CAP_LOWER_MULT * 200,  # 20
+                "is_mature": True,
+            }
+        }
+        raw = self._make_monthly_data([500] * 24)
+        capped, unclamped, label, upper, lower = fc._apply_sanity_caps(
+            5.0, "S1", "UNL", bounds, raw,
+        )
+        assert capped == 20.0
+        assert unclamped == 5.0
+        assert label == "lower_floor"
+
+    def test_new_site_uses_grade_cohort(self):
+        """6-month site should use cohort bounds, not its own history."""
+        fc = self._make_forecaster()
+        # Cohort-derived bounds (not site-specific)
+        bounds = {
+            ("NEW1", "DSL"): {
+                "upper_cap": SANITY_CAP_UPPER_MULT * 2000,  # 6000
+                "lower_floor": SANITY_CAP_LOWER_MULT * 100,  # 10
+                "is_mature": False,
+            }
+        }
+        raw = self._make_monthly_data([300] * 6)
+        capped, unclamped, label, upper, lower = fc._apply_sanity_caps(
+            8000.0, "NEW1", "DSL", bounds, raw,
+        )
+        assert capped == 6000.0
+        assert label == "upper_cap"
+
+    def test_trend_adjusted_cap(self):
+        """Growing new site gets widened cap via trend extrapolation."""
+        fc = self._make_forecaster()
+        # cohort-based upper_cap = 3 * 500 = 1500
+        bounds = {
+            ("NEW2", "UNL"): {
+                "upper_cap": SANITY_CAP_UPPER_MULT * 500,  # 1500
+                "lower_floor": 10.0,
+                "is_mature": False,
+            }
+        }
+        # Ramping volumes: trend is clearly upward
+        raw = self._make_monthly_data([200, 400, 600, 800, 1000])
+        most_recent = 1000.0
+        # Extrapolation ceiling: 2x most recent = 2000
+        # Trend-widened cap: 3 * min(extrapolated, 2000)
+        # polyfit slope is ~200/month, extrapolated forward by ~5 months = 2000
+        # ceiling clips to 2000, so trend upper = 3*2000 = 6000
+        capped, unclamped, label, upper, lower = fc._apply_sanity_caps(
+            2000.0, "NEW2", "UNL", bounds, raw,
+        )
+        # 2000 < trend-widened cap, so no cap should fire
+        assert label == ""
+        assert capped == 2000.0
+        # Verify trend widening actually raised the cap above base 1500
+        assert upper > 1500.0
+
+    def test_yoy_cap_applied(self):
+        """Forecast > 3x prior year should be capped to 3x."""
+        fc = self._make_forecaster()
+        capped, label = fc._apply_yoy_guardrails(4000.0, 1000.0)
+        assert capped == 3000.0
+        assert label == "yoy_upper"
+
+    def test_yoy_skipped_no_prior_year(self):
+        """No prior year data -> YoY skipped."""
+        fc = self._make_forecaster()
+        capped, label = fc._apply_yoy_guardrails(5000.0, None)
+        assert capped == 5000.0
+        assert label == ""
+
+        capped2, label2 = fc._apply_yoy_guardrails(5000.0, 0.0)
+        assert capped2 == 5000.0
+        assert label2 == ""
+
+    def test_no_cap_normal_forecast(self):
+        """Forecast within bounds: untouched, unclamped == clamped."""
+        fc = self._make_forecaster()
+        bounds = {
+            ("S1", "UNL"): {
+                "upper_cap": 3000.0,
+                "lower_floor": 20.0,
+                "is_mature": True,
+            }
+        }
+        raw = self._make_monthly_data([500] * 24)
+        capped, unclamped, label, upper, lower = fc._apply_sanity_caps(
+            1500.0, "S1", "UNL", bounds, raw,
+        )
+        assert capped == 1500.0
+        assert unclamped == 1500.0
+        assert label == ""
+
+    def test_both_caps_fire(self):
+        """When sanity cap fires and then YoY also fires, both labels populated."""
+        fc = self._make_forecaster()
+
+        # Build a forecast DF with an ENSEMBLE row
+        forecast_df = pd.DataFrame([{
+            "model": "ENSEMBLE",
+            "forecast_volume": 10000.0,
+            "site_id": "S1",
+            "grade": "UNL",
+            "target_month": "2025-03",
+            "prior_year_volume": 1500.0,
+            "yoy_change_pct": None,
+            "forecast_p10": pd.NA,
+            "forecast_p90": pd.NA,
+            "interval_width_pct": pd.NA,
+        }])
+
+        bounds = {
+            ("S1", "UNL"): {
+                "upper_cap": 5000.0,  # sanity caps to 5000
+                "lower_floor": 10.0,
+                "is_mature": True,
+            }
+        }
+        raw = self._make_monthly_data([500] * 24)
+
+        result = fc._apply_caps_to_forecast_df(forecast_df, bounds, raw)
+        row = result.iloc[0]
+
+        assert row["sanity_cap_applied"] == "upper_cap"
+        # After sanity cap: 5000. YoY upper = 1500 * 3 = 4500
+        assert row["yoy_cap_applied"] == "yoy_upper"
+        assert float(row["forecast_volume"]) == pytest.approx(4500.0)
+        assert float(row["forecast_volume_unclamped"]) == pytest.approx(10000.0)
+
+
+class TestReviewSheet:
+
+    def _make_forecaster(self):
+        return FuelForecaster(database=None, min_months_data=24)
+
+    def test_includes_capped_and_sparse_sites(self):
+        """Review sheet should include capped rows and sparse rows."""
+        fc = self._make_forecaster()
+        forecasts = pd.DataFrame([
+            {
+                "model": "ENSEMBLE", "site_id": "A", "grade": "UNL",
+                "sanity_cap_applied": "upper_cap", "yoy_cap_applied": "",
+                "data_quality": "good", "risk_flag": "LOW",
+                "forecast_volume": 100, "forecast_volume_unclamped": 200,
+                "upper_cap_value": 100, "lower_floor_value": 10,
+                "interval_width_pct": 5.0, "note": None,
+                "months_available": 36,
+            },
+            {
+                "model": "ENSEMBLE", "site_id": "B", "grade": "DSL",
+                "sanity_cap_applied": "", "yoy_cap_applied": "",
+                "data_quality": "sparse", "risk_flag": "LOW",
+                "forecast_volume": 50, "forecast_volume_unclamped": 50,
+                "upper_cap_value": 300, "lower_floor_value": 5,
+                "interval_width_pct": 10.0, "note": None,
+                "months_available": 8,
+            },
+            {
+                "model": "ENSEMBLE", "site_id": "C", "grade": "UNL",
+                "sanity_cap_applied": "", "yoy_cap_applied": "",
+                "data_quality": "good", "risk_flag": "LOW",
+                "forecast_volume": 80, "forecast_volume_unclamped": 80,
+                "upper_cap_value": 300, "lower_floor_value": 5,
+                "interval_width_pct": 8.0, "note": None,
+                "months_available": 36,
+            },
+        ])
+        review = fc._create_review_sheet(forecasts)
+        assert len(review) == 2
+        assert "A" in review["site_id"].values
+        assert "B" in review["site_id"].values
+        assert "C" not in review["site_id"].values
+
+    def test_sort_order(self):
+        """Capped should come before sparse, sparse before HIGH risk only."""
+        fc = self._make_forecaster()
+        forecasts = pd.DataFrame([
+            {
+                "model": "ENSEMBLE", "site_id": "RISK", "grade": "UNL",
+                "sanity_cap_applied": "", "yoy_cap_applied": "",
+                "data_quality": "good", "risk_flag": "HIGH",
+                "forecast_volume": 90, "forecast_volume_unclamped": 90,
+                "upper_cap_value": 300, "lower_floor_value": 5,
+                "interval_width_pct": 35.0, "note": None,
+                "months_available": 36,
+            },
+            {
+                "model": "ENSEMBLE", "site_id": "SPARSE", "grade": "UNL",
+                "sanity_cap_applied": "", "yoy_cap_applied": "",
+                "data_quality": "sparse", "risk_flag": "LOW",
+                "forecast_volume": 50, "forecast_volume_unclamped": 50,
+                "upper_cap_value": 300, "lower_floor_value": 5,
+                "interval_width_pct": 10.0, "note": None,
+                "months_available": 8,
+            },
+            {
+                "model": "ENSEMBLE", "site_id": "CAPPED", "grade": "UNL",
+                "sanity_cap_applied": "upper_cap", "yoy_cap_applied": "",
+                "data_quality": "good", "risk_flag": "LOW",
+                "forecast_volume": 100, "forecast_volume_unclamped": 200,
+                "upper_cap_value": 100, "lower_floor_value": 10,
+                "interval_width_pct": 5.0, "note": None,
+                "months_available": 36,
+            },
+        ])
+        review = fc._create_review_sheet(forecasts)
+        assert len(review) == 3
+        assert review.iloc[0]["site_id"] == "CAPPED"
+        assert review.iloc[1]["site_id"] == "SPARSE"
+        assert review.iloc[2]["site_id"] == "RISK"
+
+    def test_empty_when_all_clean(self):
+        """No review rows when all forecasts are clean."""
+        fc = self._make_forecaster()
+        forecasts = pd.DataFrame([
+            {
+                "model": "ENSEMBLE", "site_id": "A", "grade": "UNL",
+                "sanity_cap_applied": "", "yoy_cap_applied": "",
+                "data_quality": "good", "risk_flag": "LOW",
+                "forecast_volume": 100, "forecast_volume_unclamped": 100,
+                "upper_cap_value": 300, "lower_floor_value": 5,
+                "interval_width_pct": 5.0, "note": None,
+                "months_available": 36,
+            },
+        ])
+        review = fc._create_review_sheet(forecasts)
+        assert review.empty

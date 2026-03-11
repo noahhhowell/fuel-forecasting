@@ -554,6 +554,81 @@ class FuelDatabase:
             "created_at": row[6],
         }
 
+    def get_grade_cohort_stats(self) -> dict:
+        """Per-grade cohort max/min monthly volume from mature sites (>=12 months).
+
+        Returns:
+            {grade: {"cohort_monthly_max": float, "cohort_monthly_min": float}}
+        """
+        query = """
+        WITH monthly AS (
+            SELECT site_id, grade,
+                   strftime('%Y-%m', day) AS ym,
+                   SUM(volume) AS monthly_vol
+            FROM sales
+            WHERE COALESCE(is_estimated, 0) = 0
+            GROUP BY site_id, grade, ym
+        ),
+        mature_sites AS (
+            SELECT site_id, grade
+            FROM monthly
+            GROUP BY site_id, grade
+            HAVING COUNT(DISTINCT ym) >= 12
+        ),
+        mature_monthly AS (
+            SELECT m.grade, m.monthly_vol
+            FROM monthly m
+            INNER JOIN mature_sites ms
+                ON m.site_id = ms.site_id AND m.grade = ms.grade
+            WHERE m.monthly_vol > 0
+        )
+        SELECT grade,
+               MAX(monthly_vol) AS cohort_monthly_max,
+               MIN(monthly_vol) AS cohort_monthly_min
+        FROM mature_monthly
+        GROUP BY grade
+        """
+        rows = self.conn.execute(query).fetchall()
+        result = {}
+        for grade, cmax, cmin in rows:
+            result[grade] = {
+                "cohort_monthly_max": float(cmax) if cmax else 0.0,
+                "cohort_monthly_min": float(cmin) if cmin else 0.0,
+            }
+        return result
+
+    def get_site_monthly_stats(self) -> dict:
+        """Per (site_id, grade) monthly volume stats.
+
+        Returns:
+            {(site_id, grade): {"months_count": int, "site_monthly_max": float, "site_monthly_min": float}}
+        """
+        query = """
+        WITH monthly AS (
+            SELECT site_id, grade,
+                   strftime('%Y-%m', day) AS ym,
+                   SUM(volume) AS monthly_vol
+            FROM sales
+            WHERE COALESCE(is_estimated, 0) = 0
+            GROUP BY site_id, grade, ym
+        )
+        SELECT site_id, grade,
+               COUNT(DISTINCT ym) AS months_count,
+               MAX(monthly_vol) AS site_monthly_max,
+               MIN(CASE WHEN monthly_vol > 0 THEN monthly_vol END) AS site_monthly_min
+        FROM monthly
+        GROUP BY site_id, grade
+        """
+        rows = self.conn.execute(query).fetchall()
+        result = {}
+        for site_id, grade, mcount, smax, smin in rows:
+            result[(str(site_id), str(grade))] = {
+                "months_count": int(mcount),
+                "site_monthly_max": float(smax) if smax else 0.0,
+                "site_monthly_min": float(smin) if smin else 0.0,
+            }
+        return result
+
     def close(self):
         """Close database connection"""
         self.conn.close()

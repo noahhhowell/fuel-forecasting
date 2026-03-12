@@ -6,6 +6,8 @@ The 'db' parameter is a fixture defined in conftest.py — pytest
 automatically injects it.
 """
 
+import sqlite3
+
 import pandas as pd
 import pytest
 
@@ -136,6 +138,31 @@ class TestDataLoading:
         finally:
             db.close()
 
+    def test_load_csv_normalizes_grade_case_variants(self, tmp_path):
+        """Mixed-case grade variants should load as one uppercase grade."""
+        csv_path = tmp_path / "mixed_case.csv"
+        csv_path.write_text(
+            "site_id,grade,day,volume,is_estimated\n"
+            "999,Unl Mid,2024-01-01,500.0,0\n"
+            "999, UNL MID ,2024-01-02,510.0,0\n"
+            "999,unl mid,2024-01-03,520.0,0\n"
+        )
+
+        db = FuelDatabase(str(tmp_path / "mixed_case.db"))
+        try:
+            stats = db.load_from_csv(str(csv_path))
+            assert stats["inserted"] == 3
+
+            df = db.get_sales_data(site_ids=["999"])
+            assert len(df) == 3
+            assert set(df["grade"]) == {"UNL MID"}
+
+            stats = db.get_summary_stats()
+            assert "UNL MID" in stats["fuel_grades"]
+            assert "Unl Mid" not in stats["fuel_grades"]
+        finally:
+            db.close()
+
 
 # ---------------------------------------------------------------------------
 # NULL is_estimated handling (the COALESCE fix)
@@ -157,6 +184,29 @@ class TestNullEstimated:
 
             df = db.get_sales_data(exclude_estimated=True)
             assert len(df) == 1, "NULL is_estimated row should be included"
+        finally:
+            db.close()
+
+    def test_non_normalized_grade_insert_rejected_by_trigger(self, tmp_path):
+        """Direct SQL inserts cannot bypass the normalized-grade invariant."""
+        db = FuelDatabase(str(tmp_path / "grade_trigger.db"))
+        try:
+            with pytest.raises(
+                sqlite3.IntegrityError,
+                match="grade must be trimmed uppercase",
+            ):
+                db.conn.execute(
+                    "INSERT INTO sales (site_id, grade, day, volume, is_estimated) "
+                    "VALUES ('777', 'Unl Mid', '2024-01-01', 100.0, 0)"
+                )
+            with pytest.raises(
+                sqlite3.IntegrityError,
+                match="grade must be trimmed uppercase",
+            ):
+                db.conn.execute(
+                    "INSERT INTO sales (site_id, grade, day, volume, is_estimated) "
+                    "VALUES ('777', 'UNL MID ', '2024-01-01', 100.0, 0)"
+                )
         finally:
             db.close()
 

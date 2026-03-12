@@ -108,6 +108,31 @@ class FuelDatabase:
         )
         """
 
+        # Triggers to enforce normalized grades on every insert/update,
+        # regardless of how data enters the table (Python load_file,
+        # manual SQL, etc.).
+        create_grade_trigger_insert = """
+        CREATE TRIGGER IF NOT EXISTS trg_uppercase_grade_insert
+        BEFORE INSERT ON sales
+        BEGIN
+            SELECT RAISE(ABORT, 'grade must be trimmed uppercase')
+            WHERE LENGTH(TRIM(NEW.grade)) = 0
+               OR NEW.grade != TRIM(NEW.grade)
+               OR NEW.grade != UPPER(NEW.grade);
+        END
+        """
+
+        create_grade_trigger_update = """
+        CREATE TRIGGER IF NOT EXISTS trg_uppercase_grade_update
+        BEFORE UPDATE OF grade ON sales
+        BEGIN
+            SELECT RAISE(ABORT, 'grade must be trimmed uppercase')
+            WHERE LENGTH(TRIM(NEW.grade)) = 0
+               OR NEW.grade != TRIM(NEW.grade)
+               OR NEW.grade != UPPER(NEW.grade);
+        END
+        """
+
         with self.conn:
             self.conn.execute(create_sales)
             for idx in indexes:
@@ -116,6 +141,8 @@ class FuelDatabase:
             self.conn.execute(create_calibration_runs)
             self.conn.execute(create_calibration_weights)
             self.conn.execute(create_interval_calibration)
+            self.conn.execute(create_grade_trigger_insert)
+            self.conn.execute(create_grade_trigger_update)
 
         logger.info(f"Database initialized: {self.db_path}")
 

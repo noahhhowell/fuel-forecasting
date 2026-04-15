@@ -186,4 +186,4 @@ class TestModelRegistry:
         """Each registered model class should be instantiable."""
         for name, cls in get_available_models().items():
             instance = cls()
-            assert instance.get_name()  # should return a non-empty string
+            assert instance.name  # should return a non-empty string

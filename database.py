@@ -3,9 +3,11 @@ Database Module - SQLite operations with automatic deduplication
 """
 
 import sqlite3
-import pandas as pd
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
 import logging
 
 logger = logging.getLogger(__name__)
@@ -13,6 +15,41 @@ logger = logging.getLogger(__name__)
 
 class FuelDatabase:
     """Manages fuel sales data in SQLite"""
+
+    SALES_DB_COLUMNS = [
+        "site_id",
+        "grade",
+        "day",
+        "brand",
+        "site",
+        "address",
+        "city",
+        "state",
+        "owner",
+        "b_unit",
+        "stock",
+        "delivered",
+        "volume",
+        "is_estimated",
+        "total_sales",
+        "target",
+    ]
+    SALES_KEY_COLUMNS = ["site_id", "grade", "day"]
+    SALES_UPDATE_COLUMNS = [
+        "brand",
+        "site",
+        "address",
+        "city",
+        "state",
+        "owner",
+        "b_unit",
+        "stock",
+        "delivered",
+        "volume",
+        "is_estimated",
+        "total_sales",
+        "target",
+    ]
 
     def __init__(self, db_path: str = "fuel_sales.db", header_row: int = 4):
         """
@@ -69,6 +106,7 @@ class FuelDatabase:
             file_name TEXT,
             rows_loaded INTEGER,
             rows_duplicates INTEGER,
+            rows_updated INTEGER DEFAULT 0,
             load_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """
@@ -138,6 +176,7 @@ class FuelDatabase:
             for idx in indexes:
                 self.conn.execute(idx)
             self.conn.execute(create_metadata)
+            self._ensure_column("load_metadata", "rows_updated", "INTEGER DEFAULT 0")
             self.conn.execute(create_calibration_runs)
             self.conn.execute(create_calibration_weights)
             self.conn.execute(create_interval_calibration)
@@ -146,22 +185,76 @@ class FuelDatabase:
 
         logger.info(f"Database initialized: {self.db_path}")
 
-    def load_from_excel(self, file_path: str) -> dict:
+    def load_from_excel(self, file_path: str, replace: bool = False) -> dict:
         """Load data from Excel file with automatic deduplication"""
         logger.info(f"Loading: {file_path}")
         df = pd.read_excel(file_path, skiprows=self.header_row)
         logger.info(f"  Read {len(df):,} rows from Excel")
-        return self._load_dataframe(df, file_path)
+        return self._load_dataframe(df, file_path, replace=replace)
 
-    def load_from_csv(self, file_path: str) -> dict:
+    def load_from_csv(self, file_path: str, replace: bool = False) -> dict:
         """Load data from CSV file with automatic deduplication"""
         logger.info(f"Loading: {file_path}")
         df = pd.read_csv(file_path)
         logger.info(f"  Read {len(df):,} rows from CSV")
-        return self._load_dataframe(df, file_path)
+        return self._load_dataframe(df, file_path, replace=replace)
 
-    def _load_dataframe(self, df: pd.DataFrame, file_path: str) -> dict:
-        """Normalize columns, validate, and insert rows with deduplication"""
+    def _load_dataframe(
+        self,
+        df: pd.DataFrame,
+        file_path: str,
+        replace: bool = False,
+    ) -> dict:
+        """Normalize columns, validate, and insert rows with deduplication."""
+        load_df, total_rows, valid_rows, invalid, input_duplicates = self._prepare_sales_dataframe(df)
+        backup_path = None
+        metadata_file_name = Path(file_path).name
+
+        if replace:
+            backup_path = self.backup_database()
+            metadata_file_name = f"REPLACE::{metadata_file_name}"
+
+        with self.conn:
+            if replace:
+                self._clear_sales_and_calibration()
+            inserted, updated, unchanged = self._upsert_sales_rows(
+                load_df,
+                manage_transaction=False,
+            )
+            duplicates = unchanged + input_duplicates
+            self.conn.execute(
+                """
+                INSERT INTO load_metadata (file_name, rows_loaded, rows_duplicates, rows_updated)
+                VALUES (?, ?, ?, ?)
+                """,
+                (metadata_file_name, inserted, duplicates, updated),
+            )
+
+        logger.info(
+            "  Inserted: %s | Updated existing: %s | Duplicates skipped: %s",
+            f"{inserted:,}",
+            f"{updated:,}",
+            f"{duplicates:,}",
+        )
+
+        result = {
+            "file": Path(file_path).name,
+            "total_rows": total_rows,
+            "valid_rows": valid_rows,
+            "inserted": inserted,
+            "updated": updated,
+            "duplicates": duplicates,
+            "invalid": invalid,
+        }
+        if backup_path is not None:
+            result["backup"] = str(backup_path)
+        return result
+
+    def _prepare_sales_dataframe(
+        self,
+        df: pd.DataFrame,
+    ) -> Tuple[pd.DataFrame, int, int, int, int]:
+        """Normalize and validate a raw sales dataframe before writing it."""
         total_rows = len(df)
         df.columns = df.columns.str.strip()
         column_map = self._build_column_mapping(df.columns)
@@ -191,6 +284,7 @@ class FuelDatabase:
         if df.empty:
             raise ValueError("No valid rows after cleaning required fields")
 
+        valid_rows = len(df)
         df["day"] = df["day"].dt.strftime("%Y-%m-%d")
 
         if "is_estimated" in df.columns:
@@ -198,49 +292,143 @@ class FuelDatabase:
         else:
             df["is_estimated"] = False
 
-        db_cols = [
-            "site_id", "grade", "day", "brand", "site", "address", 
-            "city", "state", "owner", "b_unit", "stock", "delivered",
-            "volume", "is_estimated", "total_sales", "target"
-        ]
-        for col in db_cols:
+        for col in self.SALES_DB_COLUMNS:
             if col not in df.columns:
                 df[col] = None
 
-        count_before = self._get_count()
-        records = df[db_cols].itertuples(index=False, name=None)
+        load_df = df[self.SALES_DB_COLUMNS].copy()
+        deduped_df = load_df.drop_duplicates(subset=self.SALES_KEY_COLUMNS, keep="last")
+        input_duplicates = len(load_df) - len(deduped_df)
+        return deduped_df, total_rows, valid_rows, invalid, input_duplicates
 
-        sql = """
-            INSERT OR IGNORE INTO sales (
-                site_id, grade, day, brand, site, address, city, state,
-                owner, b_unit, stock, delivered, volume, is_estimated,
-                total_sales, target
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    def backup_database(self) -> Path:
+        """Create a timestamped backup of the current database file."""
+        self.conn.commit()
+        if not self.db_path.exists():
+            raise FileNotFoundError(f"Database file not found: {self.db_path}")
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = self.db_path.with_name(
+            f"{self.db_path.stem}_backup_{timestamp}{self.db_path.suffix}"
+        )
+        counter = 1
+        while backup_path.exists():
+            backup_path = self.db_path.with_name(
+                f"{self.db_path.stem}_backup_{timestamp}_{counter}{self.db_path.suffix}"
+            )
+            counter += 1
+
+        backup_conn = sqlite3.connect(backup_path)
+        try:
+            self.conn.backup(backup_conn)
+        finally:
+            backup_conn.close()
+        logger.info("Database backup created: %s", backup_path)
+        return backup_path
+
+    def _clear_sales_and_calibration(self) -> None:
+        """Delete all sales rows plus derived calibration artifacts."""
+        self.conn.execute("DELETE FROM calibration_weights")
+        self.conn.execute("DELETE FROM interval_calibration")
+        self.conn.execute("DELETE FROM calibration_runs")
+        self.conn.execute("DELETE FROM sales")
+
+    def _ensure_column(self, table_name: str, column_name: str, definition: str) -> None:
+        """Add a missing column to an existing table."""
+        existing_columns = {
+            row[1] for row in self.conn.execute(f"PRAGMA table_info({table_name})")
+        }
+        if column_name not in existing_columns:
+            self.conn.execute(
+                f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"
+            )
+
+    def _upsert_sales_rows(
+        self,
+        df: pd.DataFrame,
+        manage_transaction: bool = True,
+    ) -> tuple:
+        """Insert new rows and refresh existing keys when source data changes."""
+        if manage_transaction:
+            with self.conn:
+                return self._upsert_sales_rows(df, manage_transaction=False)
+
+        stage_table = "temp.staging_sales_load"
+        column_list = ", ".join(self.SALES_DB_COLUMNS)
+        placeholders = ", ".join("?" for _ in self.SALES_DB_COLUMNS)
+        join_on_keys = " AND ".join(
+            f"sales.{col} = staging.{col}" for col in self.SALES_KEY_COLUMNS
+        )
+        changed_predicate = " OR ".join(
+            f"sales.{col} IS NOT staging.{col}" for col in self.SALES_UPDATE_COLUMNS
+        )
+        update_assignments = ", ".join(
+            f"{col} = excluded.{col}" for col in self.SALES_UPDATE_COLUMNS
+        )
+        stage_columns_sql = """
+            site_id TEXT NOT NULL,
+            grade TEXT NOT NULL,
+            day DATE NOT NULL,
+            brand TEXT,
+            site TEXT,
+            address TEXT,
+            city TEXT,
+            state TEXT,
+            owner TEXT,
+            b_unit TEXT,
+            stock REAL,
+            delivered REAL,
+            volume REAL,
+            is_estimated BOOLEAN,
+            total_sales REAL,
+            target REAL
         """
 
-        with self.conn:
-            self.conn.executemany(sql, records)
+        insert_stage_sql = f"""
+            INSERT INTO {stage_table} ({column_list})
+            VALUES ({placeholders})
+        """
+        upsert_sql = f"""
+            INSERT INTO sales ({column_list})
+            VALUES ({placeholders})
+            ON CONFLICT(site_id, grade, day) DO UPDATE SET
+                {update_assignments}
+        """
 
-        count_after = self._get_count()
-        inserted = count_after - count_before
-        duplicates = len(df) - inserted
+        self.conn.execute(f"DROP TABLE IF EXISTS {stage_table}")
+        try:
+            self.conn.execute(f"CREATE TEMP TABLE {stage_table} ({stage_columns_sql})")
+            self.conn.executemany(
+                insert_stage_sql,
+                df[self.SALES_DB_COLUMNS].itertuples(index=False, name=None),
+            )
 
-        self.conn.execute(
-            "INSERT INTO load_metadata (file_name, rows_loaded, rows_duplicates) VALUES (?, ?, ?)",
-            (Path(file_path).name, inserted, duplicates)
-        )
-        self.conn.commit()
+            inserted = self.conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM {stage_table} AS staging
+                LEFT JOIN sales ON {join_on_keys}
+                WHERE sales.site_id IS NULL
+                """
+            ).fetchone()[0]
+            updated = self.conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM {stage_table} AS staging
+                JOIN sales ON {join_on_keys}
+                WHERE {changed_predicate}
+                """
+            ).fetchone()[0]
 
-        logger.info(f"  Inserted: {inserted:,} | Duplicates skipped: {duplicates:,}")
+            self.conn.executemany(
+                upsert_sql,
+                df[self.SALES_DB_COLUMNS].itertuples(index=False, name=None),
+            )
+        finally:
+            self.conn.execute(f"DROP TABLE IF EXISTS {stage_table}")
 
-        return {
-            "file": Path(file_path).name,
-            "total_rows": total_rows,
-            "valid_rows": len(df),
-            "inserted": inserted,
-            "duplicates": duplicates,
-            "invalid": invalid,
-        }
+        unchanged = len(df) - inserted - updated
+        return inserted, updated, unchanged
 
     def _build_column_mapping(self, columns) -> dict:
         """Build flexible column name mapping"""

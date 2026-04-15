@@ -66,15 +66,37 @@ python cli.py load --file data/fuel_data.csv
 
 # All files in a directory at once
 python cli.py load --directory ./data
+
+# Full replacement from a normalized single file
+python cli.py load --file data/normalized_access.csv --replace
 ```
 
-Deduplication is automatic (primary key: site_id + grade + day). Re-loading the same file is safe.
+Deduplication is automatic (primary key: site_id + grade + day). Re-loading the same file is safe, and re-loading a corrected export will update matching rows in place.
+
+Use `--replace` only with `--file` when you want to fully refresh the database. It creates a timestamped backup of the current database, clears `sales` plus calibration tables, then loads the new file. Run `calibrate` again after a replacement.
 
 If your Excel headers aren't on row 5, use `--header-row`:
 
 ```bash
 python cli.py load --file data/custom.xlsx --header-row 0
 ```
+
+### One-time Access CSV replacement workflow
+
+If your source is the Access-merged CSV (`merged_access_2017_2026_h1.csv`), first transform it into the standard loader shape, then replace the database:
+
+```bash
+# 1. Normalize the Access CSV into the standard loader format
+python scripts/transform_access_csv.py --input merged_access_2017_2026_h1.csv --output data/normalized_access.csv
+
+# 2. Replace the existing database contents with the normalized file
+python cli.py load --file data/normalized_access.csv --replace
+
+# 3. Rebuild calibration on the new history
+python cli.py calibrate --months 12 --output calibration_report.xlsx
+```
+
+The transform step maps Access `product` values into the existing canonical grades and aggregates rows that collapse into the same `(site_id, grade, day)`.
 
 ## Checking Status
 
@@ -273,6 +295,8 @@ python cli.py forecast 2026-04 --output forecasts/2026-04.xlsx
 ```bash
 python cli.py calibrate --months 12 --output calibration_report.xlsx
 ```
+
+After any `load --replace`, recalibration is required because previous weights and interval tables are cleared.
 
 ### Include sites with limited data
 

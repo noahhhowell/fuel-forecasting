@@ -16,7 +16,10 @@ logger = logging.getLogger(__name__)
 
 
 def load_command(args):
-    """Load data from Excel files"""
+    """Load data from Excel or CSV files."""
+    if getattr(args, "replace", False) and not args.file:
+        raise ValueError("--replace can only be used with --file")
+
     print("\n" + "=" * 60)
     print("LOADING DATA")
     print("=" * 60)
@@ -28,14 +31,17 @@ def load_command(args):
             # Single file
             suffix = Path(args.file).suffix.lower()
             if suffix == ".csv":
-                stats = db.load_from_csv(args.file)
+                stats = db.load_from_csv(args.file, replace=args.replace)
             else:
-                stats = db.load_from_excel(args.file)
+                stats = db.load_from_excel(args.file, replace=args.replace)
             print(f"\n[ok] Loaded: {stats['file']}")
             print(f"  - Inserted: {stats['inserted']:,} records")
             print(f"  - Duplicates skipped: {stats['duplicates']:,}")
             if stats.get("invalid", 0):
                 print(f"  - Invalid rows skipped: {stats['invalid']:,}")
+            if args.replace:
+                print(f"  - Backup created: {stats['backup']}")
+                print("  - Calibration cleared: Yes")
 
         elif args.directory:
             # All Excel files in directory
@@ -273,6 +279,7 @@ Examples:
   Load data:
     python cli.py load --file sales_2024.xlsx
     python cli.py load --directory ./data
+    python cli.py load --file normalized_access.csv --replace
 
   Check status:
     python cli.py status
@@ -312,10 +319,15 @@ Examples:
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
     # Load command
-    load_parser = subparsers.add_parser("load", help="Load data from Excel")
+    load_parser = subparsers.add_parser("load", help="Load data from Excel or CSV")
     load_group = load_parser.add_mutually_exclusive_group(required=True)
-    load_group.add_argument("--file", help="Single Excel file")
-    load_group.add_argument("--directory", help="Directory with Excel files")
+    load_group.add_argument("--file", help="Single Excel or CSV file")
+    load_group.add_argument("--directory", help="Directory with Excel or CSV files")
+    load_parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="Backup the database, clear sales and calibration data, then load this file",
+    )
 
     # Status command
     status_parser = subparsers.add_parser("status", help="Show database status")
@@ -404,6 +416,9 @@ Examples:
     if not args.command:
         parser.print_help()
         return
+
+    if args.command == "load" and args.replace and not getattr(args, "file", None):
+        parser.error("--replace can only be used with --file")
 
     try:
         if args.command == "load":

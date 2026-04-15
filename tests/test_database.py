@@ -7,6 +7,7 @@ automatically injects it.
 """
 
 import sqlite3
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -96,6 +97,7 @@ class TestDataLoading:
         try:
             stats = db.load_from_csv(str(csv_path))
             assert stats["inserted"] == 2
+            assert stats["updated"] == 0
             assert stats["duplicates"] == 0
         finally:
             db.close()
@@ -113,8 +115,39 @@ class TestDataLoading:
             first = db.load_from_csv(str(csv_path))
             second = db.load_from_csv(str(csv_path))
             assert first["inserted"] == 1
+            assert first["updated"] == 0
             assert second["inserted"] == 0
+            assert second["updated"] == 0
             assert second["duplicates"] == 1
+        finally:
+            db.close()
+
+    def test_corrected_rows_are_updated_on_reload(self, tmp_path):
+        """Reloading a corrected export should refresh matching keys."""
+        original_path = tmp_path / "original.csv"
+        corrected_path = tmp_path / "corrected.csv"
+        original_path.write_text(
+            "site_id,grade,day,volume,is_estimated,brand\n"
+            "999,UNL,2024-01-01,500.0,0,Old Brand\n"
+        )
+        corrected_path.write_text(
+            "site_id,grade,day,volume,is_estimated,brand\n"
+            "999,UNL,2024-01-01,650.0,0,New Brand\n"
+        )
+
+        db = FuelDatabase(str(tmp_path / "update_test.db"))
+        try:
+            first = db.load_from_csv(str(original_path))
+            second = db.load_from_csv(str(corrected_path))
+            assert first["inserted"] == 1
+            assert first["updated"] == 0
+            assert second["inserted"] == 0
+            assert second["updated"] == 1
+            assert second["duplicates"] == 0
+
+            row = db.get_sales_data(site_ids=["999"]).iloc[0]
+            assert row["volume"] == 650.0
+            assert row["brand"] == "New Brand"
         finally:
             db.close()
 
@@ -131,6 +164,7 @@ class TestDataLoading:
         try:
             stats = db.load_from_csv(str(csv_path))
             assert stats["inserted"] == 1
+            assert stats["updated"] == 0
 
             df = db.get_sales_data(site_ids=["888"])
             assert len(df) == 1
@@ -152,6 +186,7 @@ class TestDataLoading:
         try:
             stats = db.load_from_csv(str(csv_path))
             assert stats["inserted"] == 3
+            assert stats["updated"] == 0
 
             df = db.get_sales_data(site_ids=["999"])
             assert len(df) == 3
@@ -364,3 +399,101 @@ class TestCalibrationCRUD:
 
         assert db.get_interval_factors("site:100") is None
         assert db.get_interval_factors("global") is not None
+
+
+class TestReplaceLoading:
+    """Tests for destructive replacement loads."""
+
+    def test_load_csv_replace_clears_existing_sales_and_calibration(self, tmp_path):
+        csv_path = tmp_path / "replacement.csv"
+        csv_path.write_text(
+            "site_id,grade,day,volume,is_estimated\n"
+            "999,UNL,2024-02-01,500.0,0\n"
+            "999,DSL,2024-02-01,250.0,0\n"
+        )
+
+        db = FuelDatabase(str(tmp_path / "replace_test.db"))
+        try:
+            db.conn.execute(
+                "INSERT INTO sales (site_id, grade, day, volume, is_estimated) "
+                "VALUES ('111', 'UNL', '2024-01-01', 100.0, 0)"
+            )
+            run_id = db.save_calibration_run({
+                "backtest_months": 6,
+                "horizon": 2,
+                "min_months": 24,
+                "sites_calibrated": 1,
+                "overall_mape": 5.0,
+            })
+            db.save_site_weights(run_id, [
+                {"site_id": "111", "model_name": "ets", "weight": 0.7},
+            ])
+            db.save_interval_calibration(run_id, [
+                {
+                    "segment": "global",
+                    "residual_std": 0.1,
+                    "residual_p10": -0.1,
+                    "residual_p90": 0.1,
+                    "n_observations": 5,
+                },
+            ])
+
+            stats = db.load_from_csv(str(csv_path), replace=True)
+
+            assert stats["inserted"] == 2
+            assert stats["updated"] == 0
+            assert Path(stats["backup"]).exists()
+
+            data = db.get_sales_data(exclude_estimated=False)
+            assert set(data["site_id"]) == {"999"}
+            assert set(data["grade"]) == {"UNL", "DSL"}
+
+            assert db.get_latest_calibration_run() is None
+            assert db.get_site_weights_bulk() == {}
+            assert db.get_interval_factors("global") is None
+
+            metadata = pd.read_sql_query(
+                "SELECT file_name FROM load_metadata ORDER BY load_id DESC LIMIT 1",
+                db.conn,
+            )
+            assert metadata.iloc[0]["file_name"] == "REPLACE::replacement.csv"
+
+            backup_conn = sqlite3.connect(stats["backup"])
+            try:
+                backup_count = backup_conn.execute(
+                    "SELECT COUNT(*) FROM sales"
+                ).fetchone()[0]
+            finally:
+                backup_conn.close()
+            assert backup_count == 1
+        finally:
+            db.close()
+
+    def test_replace_failure_rolls_back_existing_sales(self, tmp_path, monkeypatch):
+        csv_path = tmp_path / "replacement.csv"
+        csv_path.write_text(
+            "site_id,grade,day,volume,is_estimated\n"
+            "999,UNL,2024-02-01,500.0,0\n"
+        )
+
+        db = FuelDatabase(str(tmp_path / "rollback_test.db"))
+        try:
+            db.conn.execute(
+                "INSERT INTO sales (site_id, grade, day, volume, is_estimated) "
+                "VALUES ('111', 'UNL', '2024-01-01', 100.0, 0)"
+            )
+            db.conn.commit()
+
+            def boom(*args, **kwargs):
+                raise RuntimeError("boom")
+
+            monkeypatch.setattr(db, "_upsert_sales_rows", boom)
+
+            with pytest.raises(RuntimeError, match="boom"):
+                db.load_from_csv(str(csv_path), replace=True)
+
+            data = db.get_sales_data(exclude_estimated=False)
+            assert len(data) == 1
+            assert data.iloc[0]["site_id"] == "111"
+        finally:
+            db.close()

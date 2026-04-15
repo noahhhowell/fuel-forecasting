@@ -79,9 +79,6 @@ class ForecastModel(ABC):
         """Generate predictions"""
         pass
 
-    def get_name(self) -> str:
-        return self.name
-
 
 class SeasonalNaiveModel(ForecastModel):
     """Seasonal Naive - Fast baseline using same-month-last-year logic"""

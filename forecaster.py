@@ -618,42 +618,6 @@ class FuelForecaster:
             return None
         return ((forecast_volume - prior_year_volume) / prior_year_volume) * 100
 
-    def _get_prior_year_actual_by_grade(
-        self, target_month: str, grade: str
-    ) -> Optional[float]:
-        """
-        Get actual aggregate volume for a specific grade across all sites for prior year month.
-
-        This queries the database directly for the true historical aggregate,
-        ensuring accurate YoY comparisons in summary reports.
-
-        Args:
-            target_month: Target month in 'YYYY-MM' format
-            grade: Fuel grade to filter by
-
-        Returns:
-            Actual total volume for the grade in prior year same month, or None if unavailable
-        """
-        # Handle "ALL" grade (used in site-level forecasts) by fetching total across all grades
-        if grade == "ALL":
-            return self._get_prior_year_actual_total(target_month)
-        return self._get_prior_year_actual(target_month, site_id=None, grade=grade)
-
-    def _get_prior_year_actual_total(self, target_month: str) -> Optional[float]:
-        """
-        Get actual total volume across all sites and grades for prior year month.
-
-        This queries the database directly for the true historical total,
-        ensuring accurate YoY comparisons in BU-level summary reports.
-
-        Args:
-            target_month: Target month in 'YYYY-MM' format
-
-        Returns:
-            Actual total volume for prior year same month, or None if unavailable
-        """
-        return self._get_prior_year_actual(target_month, site_id=None, grade=None)
-
     def _fallback_forecast_value(
         self, data: pd.DataFrame, months_ahead: int, note: Optional[str]
     ) -> float:
@@ -1557,7 +1521,8 @@ class FuelForecaster:
         for _, row in product_summary.iterrows():
             target_month = row["target_month"]
             grade = row["grade"]
-            prior_year_vol = self._get_prior_year_actual_by_grade(target_month, grade)
+            grade_arg = None if grade == "ALL" else grade
+            prior_year_vol = self._get_prior_year_actual(target_month, grade=grade_arg)
             prior_year_volumes.append(prior_year_vol)
             # Calculate prior year month for display
             target_date = pd.to_datetime(target_month)
@@ -1634,7 +1599,7 @@ class FuelForecaster:
         prior_year_months = []
         for _, row in bu_summary.iterrows():
             target_month = row["target_month"]
-            prior_year_vol = self._get_prior_year_actual_total(target_month)
+            prior_year_vol = self._get_prior_year_actual(target_month)
             prior_year_volumes.append(prior_year_vol)
             # Calculate prior year month for display
             target_date = pd.to_datetime(target_month)

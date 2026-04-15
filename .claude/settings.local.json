@@ -37,7 +37,8 @@
       "Bash(uv run pytest:*)",
       "Bash(echo:*)",
       "Bash(wc:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(cd \"/c/Users/noah.howell/OneDrive - Alimentation Couche-Tard/Documents/Code/fuel-forecasting\" && sqlite3 fuel_sales.db \"SELECT grade, COUNT\\(*\\) as rows, SUM\\(volume\\) as total_vol, SUM\\(CASE WHEN is_estimated = 1 THEN 1 ELSE 0 END\\) as estimated_rows FROM sales GROUP BY grade ORDER BY grade\")"
     ]
   }
 }

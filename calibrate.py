@@ -68,7 +68,13 @@ def compute_optimal_weights(site_model_mapes, weight_floor=WEIGHT_FLOOR):
     if total_floor >= 1.0:
         return {m: 1.0 / n for m in site_model_mapes}
 
-    raw = {m: 1.0 / max(mape, 0.1) for m, mape in site_model_mapes.items()}
+    def _safe_mape(value):
+        # NaN flows through max() unchanged, so guard explicitly before clamping.
+        if not np.isfinite(value):
+            return DEFAULT_MAPE_FOR_MISSING
+        return max(value, 0.1)
+
+    raw = {m: 1.0 / _safe_mape(mape) for m, mape in site_model_mapes.items()}
     total = sum(raw.values())
     normed = {m: v / total for m, v in raw.items()}
 
@@ -116,18 +122,37 @@ def _compute_ensemble_residuals(per_model_df, weights_lookup):
     """
     Compute ensemble residuals using calibrated weights.
 
-    For each (site, month), blends per-model forecasts with their calibrated
-    weights, then computes residual = (ensemble - actual) / actual.
+    For each (site, [grade,] month), blends per-model forecasts with their
+    calibrated weights, then computes residual = (ensemble - actual) / actual.
 
-    Returns a DataFrame with columns: site_id, month, residual.
+    When per_model_df has a "grade" column, the result is keyed at
+    (site_id, grade, month) so interval calibration can segment by grade.
+    Otherwise returns (site_id, month, residual) for backward compatibility.
     """
-    columns = ["site_id", "month", "residual"]
+    has_grade = (
+        per_model_df is not None
+        and not per_model_df.empty
+        and "grade" in per_model_df.columns
+    )
+    columns = (
+        ["site_id", "grade", "month", "residual"]
+        if has_grade
+        else ["site_id", "month", "residual"]
+    )
     if per_model_df is None or per_model_df.empty:
         return pd.DataFrame(columns=columns)
 
+    group_keys = ["site_id", "grade", "month"] if has_grade else ["site_id", "month"]
+
     records = []
-    grouped = per_model_df.groupby(["site_id", "month"])
-    for (site_id, month), group in grouped:
+    grouped = per_model_df.groupby(group_keys)
+    for key, group in grouped:
+        if has_grade:
+            site_id, grade, month = key
+        else:
+            site_id, month = key
+            grade = None
+
         ensemble_vol = 0.0
         total_weight = 0.0
         actual = None
@@ -142,11 +167,14 @@ def _compute_ensemble_residuals(per_model_df, weights_lookup):
 
         if total_weight > 0 and actual is not None and np.isfinite(actual) and actual > 0:
             ensemble_vol /= total_weight
-            records.append({
+            record = {
                 "site_id": site_id,
                 "month": month,
                 "residual": (ensemble_vol - actual) / actual,
-            })
+            }
+            if has_grade:
+                record["grade"] = grade
+            records.append(record)
     return pd.DataFrame(records, columns=columns)
 
 
@@ -207,7 +235,9 @@ def _run_calibration_inner(db, months, min_months, horizon, weight_floor, output
     for site_id in site_ids:
         site_data = pm_metrics[pm_metrics["site_id"] == site_id]
         site_mapes = dict(zip(site_data["model"], site_data["mape_pct"]))
-        site_n = int(site_data["n_months"].min()) if not site_data.empty else 0
+        # Use the best-observed model's n_months as the site maturity signal,
+        # rather than penalizing the whole site for the least-observed model.
+        site_n = int(site_data["n_months"].max()) if not site_data.empty else 0
 
         # Fill missing models with pessimistic default
         for model in global_mapes:
@@ -245,18 +275,35 @@ def _run_calibration_inner(db, months, min_months, horizon, weight_floor, output
         logger.warning("No ensemble residuals produced; skipping interval calibration.")
 
     segments = []
+    has_grade_residuals = (
+        not ensemble_residuals.empty and "grade" in ensemble_residuals.columns
+    )
 
-    # Per-site residuals
-    for site_id in ensemble_residuals["site_id"].unique():
-        site_resid = ensemble_residuals[
-            ensemble_residuals["site_id"] == site_id
-        ]["residual"].values
-        stats = _compute_residual_stats(site_resid)
+    if has_grade_residuals:
+        # Most specific: per (site, grade)
+        for (site_id, grade), group in ensemble_residuals.groupby(["site_id", "grade"]):
+            stats = _compute_residual_stats(group["residual"].values)
+            if stats:
+                stats["segment"] = f"site:{site_id}:grade:{grade}"
+                segments.append(stats)
+
+        # Per grade (pooled across sites) — fallback when a (site, grade)
+        # pair has too few observations for its own distribution.
+        for grade, group in ensemble_residuals.groupby("grade"):
+            stats = _compute_residual_stats(group["residual"].values)
+            if stats:
+                stats["segment"] = f"grade:{grade}"
+                segments.append(stats)
+
+    # Per site (aggregate across grades) — kept for sites with many grades
+    # where the pooled site-level distribution is still informative.
+    for site_id, group in ensemble_residuals.groupby("site_id"):
+        stats = _compute_residual_stats(group["residual"].values)
         if stats:
             stats["segment"] = f"site:{site_id}"
             segments.append(stats)
 
-    # Global residuals
+    # Global residuals — final fallback.
     global_stats = _compute_residual_stats(
         ensemble_residuals["residual"].values
     )

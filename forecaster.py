@@ -158,6 +158,10 @@ class FuelForecaster:
         self.use_adaptive_weights = use_adaptive_weights
         self._site_weights_cache = None
         self._interval_cache = {}
+        # (target_month, {(site_id, grade): volume}) set by generate_bulk_forecasts
+        # so summary builders can reuse the precomputed lookup instead of
+        # re-querying per grade/site.
+        self._pya_cache: Optional[Tuple[str, Dict[Tuple[str, str], float]]] = None
         # Softer floor for sparse site/grade combos; allows forecasting with fewer months
         self.soft_min_months = max(
             SOFT_MIN_MONTHS_FLOOR, min(SOFT_MIN_MONTHS_CEIL, self.min_months_data)
@@ -206,13 +210,16 @@ class FuelForecaster:
             risk_threshold = self.RISK_THRESHOLD_PCT
 
         factors = None
-        # Try site-level first
-        if site_id:
+        # Most specific: (site, grade) segment from per-grade calibration
+        if site_id and grade and grade != "ALL":
+            factors = self._get_interval_factors(f"site:{site_id}:grade:{grade}")
+        # Fall back to site-level (aggregates across grades)
+        if factors is None and site_id:
             factors = self._get_interval_factors(f"site:{site_id}")
-        # Try grade-level fallback if that segment exists
+        # Then grade-level (pooled across sites)
         if factors is None and grade and grade != "ALL":
             factors = self._get_interval_factors(f"grade:{grade}")
-        # Try global
+        # Global fallback
         if factors is None:
             factors = self._get_interval_factors("global")
 
@@ -360,6 +367,8 @@ class FuelForecaster:
                 f"Filled {missing} missing month(s) for site {site_label}, grade {grade_label}"
             )
 
+        # reindex drops the original index name, so reset_index produces
+        # "index"; rename it back to "date".
         reindexed = reindexed.reset_index().rename(columns={"index": "date"})
         return reindexed
 
@@ -521,6 +530,11 @@ class FuelForecaster:
         Returns:
             Actual volume for prior year same month, or None if not available
         """
+        # Prefer the precomputed bulk cache when it covers this target month.
+        if self._pya_cache is not None and self._pya_cache[0] == target_month:
+            key = (str(site_id) if site_id else "ALL", str(grade) if grade else "ALL")
+            return self._pya_cache[1].get(key)
+
         target_date = pd.to_datetime(target_month)
         prior_year_month = (target_date - pd.DateOffset(years=1)).strftime("%Y-%m")
         prior_year_start = f"{prior_year_month}-01"
@@ -911,6 +925,9 @@ class FuelForecaster:
         if months_ahead <= 0:
             raise ValueError(f"Target month {target_month} is not in the future")
 
+        # Prefer raw (ungap-filled) length when available so months_available
+        # reflects actual observed months. Only fall back to the outlier-handled
+        # frame when the caller passed only that one in.
         if monthly_data_raw_was_provided or not monthly_data_was_provided:
             months_available = len(monthly_data_raw)
         else:
@@ -1050,6 +1067,7 @@ class FuelForecaster:
         grade: str,
         bounds: Dict[tuple, Dict[str, Any]],
         monthly_data_raw: Optional[pd.DataFrame],
+        months_ahead: Optional[int] = None,
     ) -> Tuple[float, float, str, float, float]:
         """Clamp *forecast_value* to precomputed sanity bounds.
 
@@ -1075,8 +1093,10 @@ class FuelForecaster:
                 x = np.arange(len(recent))
                 slope = float(np.polyfit(x, recent["volume"].values, 1)[0])
                 if slope > 0:
-                    months_ahead = len(monthly_data_raw)  # rough extrapolation distance
-                    extrapolated = float(recent["volume"].iloc[-1]) + slope * months_ahead
+                    # Extrapolate only as far as the actual forecast horizon.
+                    # Fall back to 1 month if the caller didn't provide one.
+                    horizon = months_ahead if months_ahead and months_ahead > 0 else 1
+                    extrapolated = float(recent["volume"].iloc[-1]) + slope * horizon
                     most_recent = float(recent["volume"].iloc[-1])
                     # Cap extrapolation at TREND_EXTRAP_CEILING_MULT * most recent
                     extrapolated = min(extrapolated, TREND_EXTRAP_CEILING_MULT * most_recent)
@@ -1135,6 +1155,26 @@ class FuelForecaster:
         df["lower_floor_value"] = pd.NA
         df["yoy_cap_applied"] = ""
 
+        # Forecast horizon (months) — used to bound trend extrapolation for
+        # new sites inside _apply_sanity_caps.
+        months_ahead: Optional[int] = None
+        if (
+            monthly_data_raw is not None
+            and not monthly_data_raw.empty
+            and "target_month" in df.columns
+            and not df["target_month"].dropna().empty
+        ):
+            try:
+                last_date = pd.to_datetime(monthly_data_raw["date"].max())
+                target_date = pd.to_datetime(df["target_month"].dropna().iloc[0])
+                months_ahead = (target_date.year - last_date.year) * 12 + (
+                    target_date.month - last_date.month
+                )
+                if months_ahead <= 0:
+                    months_ahead = None
+            except Exception:
+                months_ahead = None
+
         ensemble_mask = df["model"] == "ENSEMBLE"
         for idx in df.index[ensemble_mask]:
             row = df.loc[idx]
@@ -1145,6 +1185,7 @@ class FuelForecaster:
             # Sanity caps
             vol, unclamped, sanity_label, upper_val, lower_val = self._apply_sanity_caps(
                 vol, site_id, grade, sanity_bounds, monthly_data_raw,
+                months_ahead=months_ahead,
             )
             df.at[idx, "forecast_volume"] = vol
             df.at[idx, "forecast_volume_unclamped"] = unclamped
@@ -1370,31 +1411,39 @@ class FuelForecaster:
         # Precompute sanity bounds once for the entire run
         sanity_bounds = self._precompute_sanity_bounds()
 
-        items = self.db.get_distinct_site_grades()
-        all_forecasts, skipped = self._forecast_batch(
-            items, target_month, models_to_use, show_yoy, pya,
-            skip_insufficient, self.soft_min_months,
-            log_every=50, label="site-grade combinations",
-            sanity_bounds=sanity_bounds,
-        )
+        # Expose pya to _get_prior_year_actual for summary builders.
+        prior_pya_cache = self._pya_cache
+        if pya is not None:
+            self._pya_cache = (target_month, pya)
 
-        if not all_forecasts:
-            raise ValueError("No forecasts were successfully generated")
+        try:
+            items = self.db.get_distinct_site_grades()
+            all_forecasts, skipped = self._forecast_batch(
+                items, target_month, models_to_use, show_yoy, pya,
+                skip_insufficient, self.soft_min_months,
+                log_every=50, label="site-grade combinations",
+                sanity_bounds=sanity_bounds,
+            )
 
-        valid_forecasts = [df for df in all_forecasts if not df.empty]
-        if not valid_forecasts:
-            raise ValueError("No non-empty forecast outputs were generated")
-        combined = pd.concat(valid_forecasts, ignore_index=True)
+            if not all_forecasts:
+                raise ValueError("No forecasts were successfully generated")
 
-        logger.info("\nForecast Summary:")
-        logger.info(f"  [ok] Generated: {len(all_forecasts)} forecasts")
-        if skipped:
-            logger.info(f"  [skip] Skipped: {len(skipped)} items")
+            valid_forecasts = [df for df in all_forecasts if not df.empty]
+            if not valid_forecasts:
+                raise ValueError("No non-empty forecast outputs were generated")
+            combined = pd.concat(valid_forecasts, ignore_index=True)
 
-        if output_path:
-            self._export_results(combined, skipped, output_path)
+            logger.info("\nForecast Summary:")
+            logger.info(f"  [ok] Generated: {len(all_forecasts)} forecasts")
+            if skipped:
+                logger.info(f"  [skip] Skipped: {len(skipped)} items")
 
-        return combined
+            if output_path:
+                self._export_results(combined, skipped, output_path)
+
+            return combined
+        finally:
+            self._pya_cache = prior_pya_cache
 
     def _export_results(
         self, forecasts: pd.DataFrame, skipped: List[Dict], output_path: str
@@ -1428,15 +1477,12 @@ class FuelForecaster:
         if not has_grade_detail:
             return pd.DataFrame()
 
-        # Filter to ENSEMBLE model for clean aggregation (avoid double-counting),
-        # consistent with _create_product_summary and _create_bu_summary
+        # Filter to ENSEMBLE model only. Falling back to all models would sum
+        # ETS + SNaive (etc.) and double-count volume.
         if "model" in forecasts.columns:
             grade_data = forecasts[
                 (forecasts["grade"] != "ALL") & (forecasts["model"] == "ENSEMBLE")
             ].copy()
-            if grade_data.empty:
-                # Fallback to all non-ALL grade data if no ENSEMBLE
-                grade_data = forecasts[forecasts["grade"] != "ALL"].copy()
         else:
             grade_data = forecasts[forecasts["grade"] != "ALL"].copy()
 
@@ -1492,12 +1538,10 @@ class FuelForecaster:
         if "grade" not in forecasts.columns:
             return pd.DataFrame()
 
-        # Filter to ENSEMBLE model for clean aggregation (avoid double-counting)
+        # Filter to ENSEMBLE model only. Falling back to all models would sum
+        # ETS + SNaive (etc.) and double-count volume.
         if "model" in forecasts.columns:
             ensemble_data = forecasts[forecasts["model"] == "ENSEMBLE"].copy()
-            if ensemble_data.empty:
-                # Fallback to all data if no ENSEMBLE
-                ensemble_data = forecasts.copy()
         else:
             ensemble_data = forecasts.copy()
 
@@ -1563,12 +1607,10 @@ class FuelForecaster:
         Returns:
             DataFrame with BU-level totals and YoY %
         """
-        # Filter to ENSEMBLE model for clean aggregation (avoid double-counting)
+        # Filter to ENSEMBLE model only. Falling back to all models would sum
+        # ETS + SNaive (etc.) and double-count volume.
         if "model" in forecasts.columns:
             ensemble_data = forecasts[forecasts["model"] == "ENSEMBLE"].copy()
-            if ensemble_data.empty:
-                # Fallback to all data if no ENSEMBLE
-                ensemble_data = forecasts.copy()
         else:
             ensemble_data = forecasts.copy()
 

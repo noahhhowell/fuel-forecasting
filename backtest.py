@@ -43,13 +43,14 @@ def _validate_backtest_params(months: int, min_months: int, horizon: int) -> Non
         raise ValueError("horizon must be >= 0")
 
 
-def get_actual_monthly_volume(db, site_id, month_str):
-    """Get actual total volume for a site in a given month."""
+def get_actual_monthly_volume(db, site_id, month_str, grade=None):
+    """Get actual total volume for a site (optionally per-grade) in a given month."""
     start = f"{month_str}-01"
     end = (pd.to_datetime(start) + pd.offsets.MonthEnd(0)).strftime("%Y-%m-%d")
+    grades = [grade] if grade else None
     df = db.get_sales_data(
         start_date=start, end_date=end,
-        site_ids=[site_id], exclude_estimated=True,
+        site_ids=[site_id], grades=grades, exclude_estimated=True,
     )
     if df.empty:
         return None
@@ -193,42 +194,45 @@ def _run_backtest_inner(db, months, output, min_months, horizon,
         (last_complete.to_period("M") - i).to_timestamp() for i in range(months)
     )
 
-    # Get sites with enough data
-    sites_df = db.get_distinct_sites()
-    print(f"Backtest: {months} months, {len(sites_df)} sites total, horizon={horizon} months ahead\n")
+    # Get site/grade combos with enough data — backtesting at the same grain
+    # as production forecasting (per-site-per-grade) so calibrated weights and
+    # residuals reflect the actual unit of prediction.
+    site_grades_df = db.get_distinct_site_grades()
+    print(f"Backtest: {months} months, {len(site_grades_df)} site-grade combos, horizon={horizon} months ahead\n")
     print(f"Test period: {test_months[0].strftime('%Y-%m')} to {test_months[-1].strftime('%Y-%m')}")
     print(f"Checking data sufficiency...\n")
 
     earliest_test = test_months[0]
-    qualified_sites = []
-    for _, row in sites_df.iterrows():
+    qualified_combos = []  # list of (site_id, grade)
+    for _, row in site_grades_df.iterrows():
         site_id = row["site_id"]
+        grade = row["grade"]
         cutoff = (earliest_test - pd.DateOffset(months=horizon, days=1)).strftime("%Y-%m-%d")
         try:
             data = forecaster.prepare_monthly_data(
-                site_id=site_id, end_date=cutoff,
+                site_id=site_id, grade=grade, end_date=cutoff,
                 handle_outliers=False, fill_gaps=False,
             )
         except ValueError:
             continue
         if len(data) >= min_months:
-            qualified_sites.append(site_id)
+            qualified_combos.append((site_id, grade))
 
-    print(f"Sites with >= {min_months} months of pre-test data: {len(qualified_sites)}")
-    if not qualified_sites:
-        print("No sites have enough data for backtesting.")
+    print(f"Site-grade combos with >= {min_months} months of pre-test data: {len(qualified_combos)}")
+    if not qualified_combos:
+        print("No site-grade combos have enough data for backtesting.")
         if return_per_model:
             return None, None, None
         return None, None
 
-    # Run forecasts for each site x test month
+    # Run forecasts for each (site, grade) x test month
     results = []
     per_model_results = []
     skipped_count = 0
-    total_combos = len(qualified_sites) * len(test_months)
+    total_combos = len(qualified_combos) * len(test_months)
     done = 0
 
-    for site_id in qualified_sites:
+    for site_id, grade in qualified_combos:
         for test_month in test_months:
             done += 1
             if done % 50 == 0 or done == total_combos:
@@ -236,7 +240,7 @@ def _run_backtest_inner(db, months, output, min_months, horizon,
 
             target = test_month.strftime("%Y-%m")
 
-            actual = get_actual_monthly_volume(db, site_id, target)
+            actual = get_actual_monthly_volume(db, site_id, target, grade=grade)
             if actual is None or actual <= 0:
                 continue
 
@@ -244,11 +248,11 @@ def _run_backtest_inner(db, months, output, min_months, horizon,
 
             try:
                 monthly_data = forecaster.prepare_monthly_data(
-                    site_id=site_id, end_date=cutoff,
+                    site_id=site_id, grade=grade, end_date=cutoff,
                     handle_outliers=True, fill_gaps=True,
                 )
                 monthly_data_raw = forecaster.prepare_monthly_data(
-                    site_id=site_id, end_date=cutoff,
+                    site_id=site_id, grade=grade, end_date=cutoff,
                     handle_outliers=False, fill_gaps=False,
                 )
 
@@ -258,6 +262,7 @@ def _run_backtest_inner(db, months, output, min_months, horizon,
                 forecast_df = forecaster.generate_forecast(
                     target_month=target,
                     site_id=site_id,
+                    grade=grade,
                     monthly_data=monthly_data,
                     monthly_data_raw=monthly_data_raw,
                     show_yoy=False,
@@ -272,6 +277,7 @@ def _run_backtest_inner(db, months, output, min_months, horizon,
 
                 results.append({
                     "site_id": site_id,
+                    "grade": grade,
                     "month": target,
                     "forecast": round(forecast_vol, 1),
                     "actual": round(actual, 1),
@@ -289,6 +295,7 @@ def _run_backtest_inner(db, months, output, min_months, horizon,
                         residual = (model_vol - actual) / actual
                         per_model_results.append({
                             "site_id": site_id,
+                            "grade": grade,
                             "month": target,
                             "model": model_name,
                             "forecast": round(model_vol, 1),
@@ -300,12 +307,12 @@ def _run_backtest_inner(db, months, output, min_months, horizon,
             except (ValueError, KeyError) as e:
                 # Expected data-related errors - count them so the user sees the skip rate
                 skipped_count += 1
-                logger.info(f"Skipped site {site_id}, month {target}: {e}")
+                logger.info(f"Skipped site {site_id}, grade {grade}, month {target}: {e}")
                 continue
             except Exception as e:
                 # Unexpected errors - log at warning so they surface
                 skipped_count += 1
-                logger.warning(f"Site {site_id}, month {target}: {e}")
+                logger.warning(f"Site {site_id}, grade {grade}, month {target}: {e}")
                 continue
 
     print()  # clear progress line

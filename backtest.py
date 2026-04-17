@@ -12,7 +12,6 @@ Usage:
 
 import argparse
 import logging
-import sys
 
 import numpy as np
 import pandas as pd
@@ -33,14 +32,19 @@ MAPE_GOOD_THRESHOLD = 5
 MAPE_ACCEPTABLE_THRESHOLD = 10
 
 
-def _validate_backtest_params(months: int, min_months: int, horizon: int) -> None:
-    """Validate backtest configuration values."""
+def _validate_month_params(months: int, min_months: int, horizon: int) -> None:
+    """Shared month/horizon validation used by backtest and calibration."""
     if months < 1:
         raise ValueError("months must be >= 1")
     if min_months < 1:
         raise ValueError("min_months must be >= 1")
     if horizon < 0:
         raise ValueError("horizon must be >= 0")
+
+
+def _validate_backtest_params(months: int, min_months: int, horizon: int) -> None:
+    """Validate backtest configuration values."""
+    _validate_month_params(months, min_months, horizon)
 
 
 def get_actual_monthly_volume(db, site_id, month_str, grade=None):

@@ -13,7 +13,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-from backtest import _run_backtest_inner, build_per_model_site_metrics
+from backtest import _run_backtest_inner, _validate_month_params, build_per_model_site_metrics
 from database import FuelDatabase
 
 logger = logging.getLogger(__name__)
@@ -32,12 +32,7 @@ DOMINANCE_THRESHOLD = 0.65
 
 def _validate_calibration_params(months, min_months, horizon, weight_floor):
     """Validate user-provided calibration parameters."""
-    if months < 1:
-        raise ValueError("months must be >= 1")
-    if min_months < 1:
-        raise ValueError("min_months must be >= 1")
-    if horizon < 0:
-        raise ValueError("horizon must be >= 0")
+    _validate_month_params(months, min_months, horizon)
     if not np.isfinite(weight_floor):
         raise ValueError("weight_floor must be a finite number")
     if weight_floor < 0:

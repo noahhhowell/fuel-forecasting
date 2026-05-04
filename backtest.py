@@ -2,7 +2,8 @@
 Backtest - Evaluate forecast accuracy against historical actuals.
 
 Holds out recent months, generates forecasts using only prior data,
-and compares to what actually happened. Zero changes to core code.
+applies the same post-processing guardrails used in production exports,
+and compares to what actually happened.
 
 Usage:
     python backtest.py
@@ -59,6 +60,14 @@ def get_actual_monthly_volume(db, site_id, month_str, grade=None):
     if df.empty:
         return None
     return float(df["volume"].sum())
+
+
+def _prior_year_known_by_cutoff(month_str: str, cutoff: str) -> bool:
+    """Return True if prior-year same-month actuals exist before forecast cutoff."""
+    target_date = pd.to_datetime(f"{month_str}-01")
+    prior_year_start = target_date - pd.DateOffset(years=1)
+    prior_year_end = prior_year_start + pd.offsets.MonthEnd(0)
+    return prior_year_end <= pd.to_datetime(cutoff)
 
 
 def _trimmed_mean_drop_worst(values: pd.Series) -> float:
@@ -145,21 +154,28 @@ def _parse_max_date(stats: dict) -> pd.Timestamp:
 
 def build_per_model_site_metrics(per_model_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Build per-site per-model error metrics.
+    Build per-site(/grade) per-model error metrics.
 
-    Returns columns: site_id, model, mape_pct, n_months
+    Returns columns: site_id, [grade,] model, mape_pct, n_months
     """
+    base_columns = ["site_id", "model", "mape_pct", "n_months"]
+    if "grade" in per_model_df.columns:
+        base_columns = ["site_id", "grade", "model", "mape_pct", "n_months"]
     if per_model_df.empty:
-        return pd.DataFrame(columns=["site_id", "model", "mape_pct", "n_months"])
+        return pd.DataFrame(columns=base_columns)
 
     clean = per_model_df.copy()
     clean["error_pct"] = pd.to_numeric(clean["error_pct"], errors="coerce")
     clean = clean[np.isfinite(clean["error_pct"])].copy()
     if clean.empty:
-        return pd.DataFrame(columns=["site_id", "model", "mape_pct", "n_months"])
+        return pd.DataFrame(columns=base_columns)
+
+    group_cols = ["site_id", "model"]
+    if "grade" in clean.columns:
+        group_cols = ["site_id", "grade", "model"]
 
     return (
-        clean.groupby(["site_id", "model"])["error_pct"]
+        clean.groupby(group_cols)["error_pct"]
         .agg(mape_pct="mean", n_months="count")
         .reset_index()
     )
@@ -235,6 +251,7 @@ def _run_backtest_inner(db, months, output, min_months, horizon,
     skipped_count = 0
     total_combos = len(qualified_combos) * len(test_months)
     done = 0
+    sanity_bounds_cache = {}
 
     for site_id, grade in qualified_combos:
         for test_month in test_months:
@@ -263,13 +280,23 @@ def _run_backtest_inner(db, months, output, min_months, horizon,
                 if len(monthly_data) < min_months:
                     continue
 
+                show_yoy = _prior_year_known_by_cutoff(target, cutoff)
                 forecast_df = forecaster.generate_forecast(
                     target_month=target,
                     site_id=site_id,
                     grade=grade,
                     monthly_data=monthly_data,
                     monthly_data_raw=monthly_data_raw,
-                    show_yoy=False,
+                    show_yoy=show_yoy,
+                )
+                if cutoff not in sanity_bounds_cache:
+                    sanity_bounds_cache[cutoff] = forecaster._precompute_sanity_bounds(
+                        end_date=cutoff
+                    )
+                forecast_df = forecaster._apply_caps_to_forecast_df(
+                    forecast_df,
+                    sanity_bounds_cache[cutoff],
+                    monthly_data_raw,
                 )
 
                 ensemble = forecast_df[forecast_df["model"] == "ENSEMBLE"]
@@ -415,4 +442,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

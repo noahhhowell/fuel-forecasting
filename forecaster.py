@@ -149,7 +149,7 @@ class FuelForecaster:
         Args:
             database: FuelDatabase instance
             min_months_data: Minimum months of data required (default: 24)
-            use_adaptive_weights: Use calibrated per-site weights if available (default: True)
+            use_adaptive_weights: Use calibrated site-grade weights if available (default: True)
         """
         self.db = database
         self.min_months_data = min_months_data
@@ -157,6 +157,7 @@ class FuelForecaster:
         self.ensemble_weights = self.DEFAULT_ENSEMBLE_WEIGHTS.copy()
         self.use_adaptive_weights = use_adaptive_weights
         self._site_weights_cache = None
+        self._calibration_run_cache = None
         self._interval_cache = {}
         # (target_month, {(site_id, grade): volume}) set by generate_bulk_forecasts
         # so summary builders can reuse the precomputed lookup instead of
@@ -167,8 +168,8 @@ class FuelForecaster:
             SOFT_MIN_MONTHS_FLOOR, min(SOFT_MIN_MONTHS_CEIL, self.min_months_data)
         )
 
-    def _load_site_weights(self) -> Dict[str, Dict[str, float]]:
-        """Lazy-load calibrated site weights from the database."""
+    def _load_site_weights(self) -> Dict[Tuple[str, str], Dict[str, float]]:
+        """Lazy-load calibrated site-grade weights from the database."""
         if self._site_weights_cache is None:
             if self.db is not None and self.use_adaptive_weights:
                 try:
@@ -178,6 +179,35 @@ class FuelForecaster:
             else:
                 self._site_weights_cache = {}
         return self._site_weights_cache
+
+    def _get_latest_calibration_run(self) -> Optional[Dict[str, Any]]:
+        """Lazy-load latest calibration metadata."""
+        if self._calibration_run_cache is None:
+            if self.db is not None and self.use_adaptive_weights:
+                try:
+                    self._calibration_run_cache = self.db.get_latest_calibration_run()
+                except Exception:
+                    self._calibration_run_cache = {}
+            else:
+                self._calibration_run_cache = {}
+        return self._calibration_run_cache or None
+
+    def _calibration_matches_horizon(self, months_ahead: Optional[int]) -> bool:
+        """Return True when the latest calibration was fitted for this horizon."""
+        if not self.use_adaptive_weights or months_ahead is None:
+            return False
+        run = self._get_latest_calibration_run()
+        if not run:
+            return False
+        try:
+            # Backtest/calibration horizon is expressed as the business lead
+            # time. Because forecasts train only on complete months, a
+            # 2-month lead such as "Feb submission for April target" is a
+            # 3-step model forecast from the latest complete month (January).
+            calibrated_months_ahead = int(run["horizon"]) + 1
+            return calibrated_months_ahead == int(months_ahead)
+        except (KeyError, TypeError, ValueError):
+            return False
 
     def _get_interval_factors(self, segment: str) -> Optional[Dict]:
         """Lookup interval factors with caching."""
@@ -197,6 +227,7 @@ class FuelForecaster:
         forecast: float,
         site_id: Optional[str] = None,
         grade: Optional[str] = None,
+        months_ahead: Optional[int] = None,
         risk_threshold: float = None,
     ) -> Dict[str, Any]:
         """
@@ -208,6 +239,14 @@ class FuelForecaster:
         """
         if risk_threshold is None:
             risk_threshold = self.RISK_THRESHOLD_PCT
+
+        if not self._calibration_matches_horizon(months_ahead):
+            return {
+                "forecast_p10": None,
+                "forecast_p90": None,
+                "interval_width_pct": None,
+                "risk_flag": None,
+            }
 
         factors = None
         # Most specific: (site, grade) segment from per-grade calibration
@@ -231,8 +270,15 @@ class FuelForecaster:
                 "risk_flag": None,
             }
 
-        p10 = max(0.0, forecast * (1 + factors["residual_p10"]))
-        p90 = forecast * (1 + factors["residual_p90"])
+        # Residuals are calibrated as r = (forecast - actual) / actual.
+        # Inverting that relationship gives actual = forecast / (1 + r).
+        # A high positive residual means historical forecasts were too high,
+        # so it maps to the lower actual quantile.
+        min_denom = 1e-6
+        p10_denom = max(min_denom, 1 + factors["residual_p90"])
+        p90_denom = max(min_denom, 1 + factors["residual_p10"])
+        p10 = max(0.0, forecast / p10_denom)
+        p90 = max(p10, forecast / p90_denom)
         width_pct = (p90 - p10) / forecast * 100 if forecast > 0 else None
         risk_flag = "HIGH" if width_pct is not None and width_pct > risk_threshold else ""
 
@@ -244,18 +290,30 @@ class FuelForecaster:
         }
 
     def _compute_ensemble_forecast(
-        self, model_forecasts: Dict[str, float], site_id: Optional[str] = None
+        self,
+        model_forecasts: Dict[str, float],
+        site_id: Optional[str] = None,
+        grade: Optional[str] = None,
+        months_ahead: Optional[int] = None,
     ) -> float:
         """Compute a weighted ensemble with adaptive weights and robust fallback."""
         if not model_forecasts:
             raise ValueError("Cannot compute ensemble without model forecasts")
 
-        # Try site-specific calibrated weights
+        # Try calibrated weights at the most specific available grain.
         weights = self.ensemble_weights
-        if site_id and self.use_adaptive_weights:
+        if site_id and self.use_adaptive_weights and self._calibration_matches_horizon(months_ahead):
             site_weights = self._load_site_weights()
-            if site_id in site_weights:
-                weights = site_weights[site_id]
+            grade_key = str(grade) if grade else "ALL"
+            site_key = str(site_id)
+            if (site_key, grade_key) in site_weights:
+                weights = site_weights[(site_key, grade_key)]
+            elif (site_key, "ALL") in site_weights:
+                weights = site_weights[(site_key, "ALL")]
+            elif site_key in site_weights:
+                # Backward compatibility for older in-memory callers that still
+                # provide {site_id: weights}.
+                weights = site_weights[site_key]
 
         weighted_sum = 0.0
         weight_total = 0.0
@@ -933,6 +991,19 @@ class FuelForecaster:
         else:
             months_available = len(monthly_data)
         data_quality, quality_note = self._assess_data_quality(months_available)
+        calibration_note = None
+        if self.use_adaptive_weights:
+            run = self._get_latest_calibration_run()
+            if run and not self._calibration_matches_horizon(months_ahead):
+                try:
+                    calibrated_model_horizon = int(run["horizon"]) + 1
+                except (KeyError, TypeError, ValueError):
+                    calibrated_model_horizon = "unknown"
+                calibration_note = (
+                    f"Calibration horizon {run.get('horizon')} "
+                    f"(model horizon {calibrated_model_horizon}) does not match "
+                    f"current model horizon {months_ahead}; using default weights and no intervals"
+                )
 
         available_models = get_available_models()
         if models_to_use is None:
@@ -941,7 +1012,8 @@ class FuelForecaster:
         # Generate predictions - train each model with appropriate data
         results = []
         forecasts_for_ensemble: Dict[str, float] = {}
-        note = quality_note
+        note_parts = [part for part in (quality_note, calibration_note) if part]
+        note = "; ".join(note_parts) if note_parts else None
         fallback_value = None
 
         for model_name in models_to_use:
@@ -993,7 +1065,10 @@ class FuelForecaster:
         ensemble_note = note or ("Used fallback forecast" if fallback_value is not None else None)
         if forecasts_for_ensemble:
             ensemble_forecast = self._compute_ensemble_forecast(
-                forecasts_for_ensemble, site_id=site_id
+                forecasts_for_ensemble,
+                site_id=site_id,
+                grade=grade,
+                months_ahead=months_ahead,
             )
             snaive_fallback_in_results = any(
                 r.get("snaive_used_fallback") for r in results if r.get("model") == "snaive"
@@ -1015,7 +1090,10 @@ class FuelForecaster:
 
             # Compute prediction intervals for the ensemble
             intervals = self._compute_intervals(
-                ensemble_forecast, site_id=site_id, grade=grade,
+                ensemble_forecast,
+                site_id=site_id,
+                grade=grade,
+                months_ahead=months_ahead,
             )
             ensemble_row_data.update(intervals)
 
@@ -1026,17 +1104,18 @@ class FuelForecaster:
 
     # -- post-forecast sanity caps & guardrails --------------------------------
 
-    def _precompute_sanity_bounds(self) -> Dict[tuple, Dict[str, Any]]:
+    def _precompute_sanity_bounds(self, end_date: Optional[str] = None) -> Dict[tuple, Dict[str, Any]]:
         """Precompute per-(site_id, grade) sanity cap bounds.
 
         Mature sites (>=MATURE_SITE_MONTHS months) use their own history.
         New sites use grade-cohort stats from mature sites.
+        When end_date is provided, only history at or before that date is used.
 
         Returns:
             {(site_id, grade): {"upper_cap": float, "lower_floor": float, "is_mature": bool}}
         """
-        cohort_stats = self.db.get_grade_cohort_stats()
-        site_stats = self.db.get_site_monthly_stats()
+        cohort_stats = self.db.get_grade_cohort_stats(end_date=end_date)
+        site_stats = self.db.get_site_monthly_stats(end_date=end_date)
 
         bounds: Dict[tuple, Dict[str, Any]] = {}
         for (site_id, grade), stats in site_stats.items():
@@ -1208,28 +1287,18 @@ class FuelForecaster:
             else:
                 df.at[idx, "yoy_cap_applied"] = ""
 
-            # If any cap fired, clip p10/p90 to the effective bounds
+            # If any cap fired, the empirical residual interval no longer has
+            # its nominal interpretation. Leave intervals blank instead of
+            # presenting post-hoc-clipped bounds as calibrated uncertainty.
             final_vol = float(df.at[idx, "forecast_volume"])
             if final_vol != unclamped:
                 for pcol in ("forecast_p10", "forecast_p90"):
                     if pcol in df.columns and pd.notna(df.at[idx, pcol]):
-                        pval = float(df.at[idx, pcol])
-                        # Clip p10/p90 so they don't exceed the cap
-                        if upper_val and np.isfinite(upper_val):
-                            pval = min(pval, upper_val)
-                        pval = max(pval, lower_val)
-                        df.at[idx, pcol] = pval
-                # Recalculate interval width
-                if (
-                    "forecast_p10" in df.columns
-                    and "forecast_p90" in df.columns
-                    and pd.notna(df.at[idx, "forecast_p10"])
-                    and pd.notna(df.at[idx, "forecast_p90"])
-                    and final_vol > 0
-                ):
-                    p10 = float(df.at[idx, "forecast_p10"])
-                    p90 = float(df.at[idx, "forecast_p90"])
-                    df.at[idx, "interval_width_pct"] = (p90 - p10) / final_vol * 100
+                        df.at[idx, pcol] = pd.NA
+                if "interval_width_pct" in df.columns:
+                    df.at[idx, "interval_width_pct"] = pd.NA
+                if "risk_flag" in df.columns:
+                    df.at[idx, "risk_flag"] = "CAPPED"
 
         return df
 
@@ -1874,4 +1943,3 @@ class FuelForecaster:
             skipped_path = base.with_name(f"{base.stem}_skipped.csv")
             skipped_df.to_csv(skipped_path, index=False)
             logger.info(f"  -> Skipped items saved to: {skipped_path}")
-

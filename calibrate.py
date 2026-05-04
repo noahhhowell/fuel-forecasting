@@ -152,7 +152,19 @@ def _compute_ensemble_residuals(per_model_df, weights_lookup):
         total_weight = 0.0
         actual = None
         for _, row in group.iterrows():
-            w = weights_lookup.get((row["site_id"], row["model"]), 0.0)
+            if has_grade:
+                w = weights_lookup.get(
+                    (row["site_id"], row["grade"], row["model"]),
+                    weights_lookup.get(
+                        (row["site_id"], "ALL", row["model"]),
+                        weights_lookup.get((row["site_id"], row["model"]), 0.0),
+                    ),
+                )
+            else:
+                w = weights_lookup.get(
+                    (row["site_id"], "ALL", row["model"]),
+                    weights_lookup.get((row["site_id"], row["model"]), 0.0),
+                )
             forecast = row["forecast"]
             if not np.isfinite(forecast):
                 continue
@@ -217,7 +229,10 @@ def _run_calibration_inner(db, months, min_months, horizon, weight_floor, output
         print("Calibration failed: no per-model metrics.")
         return None
 
-    # -- Step 2: Compute optimal weights per site --
+    # -- Step 2: Compute optimal weights per site/grade forecast unit --
+    has_grade_metrics = "grade" in pm_metrics.columns
+    group_cols = ["site_id", "grade"] if has_grade_metrics else ["site_id"]
+    calibration_units = list(pm_metrics.groupby(group_cols, dropna=False))
     site_ids = pm_metrics["site_id"].unique()
 
     # Global average MAPE per model (fallback)
@@ -227,8 +242,13 @@ def _run_calibration_inner(db, months, min_months, horizon, weight_floor, output
     global_weights = compute_optimal_weights(global_mapes, weight_floor)
 
     weight_records = []
-    for site_id in site_ids:
-        site_data = pm_metrics[pm_metrics["site_id"] == site_id]
+    for key, site_data in calibration_units:
+        if has_grade_metrics:
+            site_id, grade = key
+            grade = str(grade)
+        else:
+            site_id = key[0] if isinstance(key, tuple) else key
+            grade = "ALL"
         site_mapes = dict(zip(site_data["model"], site_data["mape_pct"]))
         # Use the best-observed model's n_months as the site maturity signal,
         # rather than penalizing the whole site for the least-observed model.
@@ -251,6 +271,7 @@ def _run_calibration_inner(db, months, min_months, horizon, weight_floor, output
             ].iloc[0]) if model_name in site_data["model"].values else 0
             weight_records.append({
                 "site_id": site_id,
+                "grade": grade,
                 "model_name": model_name,
                 "weight": round(weight, 4),
                 "mape_pct": round(mape_val, 2) if mape_val is not None else None,
@@ -262,7 +283,7 @@ def _run_calibration_inner(db, months, min_months, horizon, weight_floor, output
     # pooling raw per-model residuals (which would inflate intervals for
     # models with high error but low weight).
     weights_lookup = {
-        (r["site_id"], r["model_name"]): r["weight"]
+        (r["site_id"], r.get("grade", "ALL"), r["model_name"]): r["weight"]
         for r in weight_records
     }
     ensemble_residuals = _compute_ensemble_residuals(per_model_df, weights_lookup)
@@ -333,6 +354,9 @@ def _print_summary(weights_df, overall_mape, n_sites, run_id):
     """Print calibration summary to console."""
     print(f"\nCalibration complete (run_id={run_id})")
     print(f"  Sites calibrated: {n_sites}")
+    if "grade" in weights_df.columns:
+        combos = weights_df[["site_id", "grade"]].drop_duplicates()
+        print(f"  Site-grade weights calibrated: {len(combos)}")
     print(f"  Overall MAPE: {overall_mape:.1f}%\n")
 
     # Classify sites
@@ -340,8 +364,8 @@ def _print_summary(weights_df, overall_mape, n_sites, run_id):
     snaive_dominant = 0
     balanced = 0
 
-    for site_id in weights_df["site_id"].unique():
-        site_w = weights_df[weights_df["site_id"] == site_id]
+    unit_cols = ["site_id", "grade"] if "grade" in weights_df.columns else ["site_id"]
+    for _, site_w in weights_df.groupby(unit_cols):
         ets_row = site_w[site_w["model_name"] == "ets"]
         snaive_row = site_w[site_w["model_name"] == "snaive"]
         ets_w = float(ets_row["weight"].iloc[0]) if not ets_row.empty else 0.5

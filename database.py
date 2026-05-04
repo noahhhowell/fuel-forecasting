@@ -126,23 +126,25 @@ class FuelDatabase:
         create_calibration_weights = """
         CREATE TABLE IF NOT EXISTS calibration_weights (
             site_id TEXT NOT NULL,
+            grade TEXT NOT NULL DEFAULT 'ALL',
             model_name TEXT NOT NULL,
             weight REAL NOT NULL,
             mape_pct REAL,
             n_months INTEGER,
             run_id INTEGER NOT NULL REFERENCES calibration_runs(run_id),
-            PRIMARY KEY (site_id, model_name)
+            PRIMARY KEY (run_id, site_id, grade, model_name)
         )
         """
 
         create_interval_calibration = """
         CREATE TABLE IF NOT EXISTS interval_calibration (
-            segment TEXT NOT NULL PRIMARY KEY,
+            segment TEXT NOT NULL,
             residual_std REAL NOT NULL,
             residual_p10 REAL NOT NULL,
             residual_p90 REAL NOT NULL,
             n_observations INTEGER,
-            run_id INTEGER NOT NULL REFERENCES calibration_runs(run_id)
+            run_id INTEGER NOT NULL REFERENCES calibration_runs(run_id),
+            PRIMARY KEY (run_id, segment)
         )
         """
 
@@ -178,8 +180,8 @@ class FuelDatabase:
             self.conn.execute(create_metadata)
             self._ensure_column("load_metadata", "rows_updated", "INTEGER DEFAULT 0")
             self.conn.execute(create_calibration_runs)
-            self.conn.execute(create_calibration_weights)
-            self.conn.execute(create_interval_calibration)
+            self._ensure_calibration_weights_schema(create_calibration_weights)
+            self._ensure_interval_calibration_schema(create_interval_calibration)
             self.conn.execute(create_grade_trigger_insert)
             self.conn.execute(create_grade_trigger_update)
 
@@ -342,6 +344,89 @@ class FuelDatabase:
             self.conn.execute(
                 f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"
             )
+
+    def _table_exists(self, table_name: str) -> bool:
+        """Return True when a SQLite table exists."""
+        row = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        return row is not None
+
+    def _table_pk_columns(self, table_name: str) -> List[str]:
+        """Return primary-key columns in declared key order."""
+        rows = self.conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        pk_rows = sorted((row for row in rows if row[5]), key=lambda row: row[5])
+        return [row[1] for row in pk_rows]
+
+    def _ensure_calibration_weights_schema(self, create_sql: str) -> None:
+        """Migrate calibration weights to run- and grade-scoped keys."""
+        table = "calibration_weights"
+        desired_pk = ["run_id", "site_id", "grade", "model_name"]
+        if not self._table_exists(table):
+            self.conn.execute(create_sql)
+            return
+
+        columns = {
+            row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")
+        }
+        if "grade" in columns and self._table_pk_columns(table) == desired_pk:
+            return
+
+        legacy = f"{table}_legacy_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+        self.conn.execute(f"ALTER TABLE {table} RENAME TO {legacy}")
+        self.conn.execute(create_sql)
+
+        legacy_columns = {
+            row[1] for row in self.conn.execute(f"PRAGMA table_info({legacy})")
+        }
+        grade_expr = "grade" if "grade" in legacy_columns else "'ALL'"
+        self.conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {table}
+                (site_id, grade, model_name, weight, mape_pct, n_months, run_id)
+            SELECT
+                site_id,
+                COALESCE(NULLIF(TRIM({grade_expr}), ''), 'ALL') AS grade,
+                model_name,
+                weight,
+                mape_pct,
+                n_months,
+                run_id
+            FROM {legacy}
+            """
+        )
+        self.conn.execute(f"DROP TABLE {legacy}")
+
+    def _ensure_interval_calibration_schema(self, create_sql: str) -> None:
+        """Migrate interval calibration to preserve rows from every run."""
+        table = "interval_calibration"
+        desired_pk = ["run_id", "segment"]
+        if not self._table_exists(table):
+            self.conn.execute(create_sql)
+            return
+
+        if self._table_pk_columns(table) == desired_pk:
+            return
+
+        legacy = f"{table}_legacy_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+        self.conn.execute(f"ALTER TABLE {table} RENAME TO {legacy}")
+        self.conn.execute(create_sql)
+        self.conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {table}
+                (segment, residual_std, residual_p10, residual_p90, n_observations, run_id)
+            SELECT
+                segment,
+                residual_std,
+                residual_p10,
+                residual_p90,
+                n_observations,
+                run_id
+            FROM {legacy}
+            """
+        )
+        self.conn.execute(f"DROP TABLE {legacy}")
 
     def _upsert_sales_rows(
         self,
@@ -673,14 +758,14 @@ class FuelDatabase:
         return cursor.lastrowid
 
     def save_site_weights(self, run_id: int, weights: List[Dict]) -> int:
-        """Bulk upsert site-level model weights. Returns rows written."""
+        """Bulk upsert model weights. Returns rows written."""
         sql = """
         INSERT OR REPLACE INTO calibration_weights
-            (site_id, model_name, weight, mape_pct, n_months, run_id)
-        VALUES (?, ?, ?, ?, ?, ?)
+            (site_id, grade, model_name, weight, mape_pct, n_months, run_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """
         rows = [
-            (w["site_id"], w["model_name"], w["weight"],
+            (w["site_id"], w.get("grade") or "ALL", w["model_name"], w["weight"],
              w.get("mape_pct"), w.get("n_months"), run_id)
             for w in weights
         ]
@@ -712,21 +797,22 @@ class FuelDatabase:
             return None
         return int(row[0])
 
-    def get_site_weights_bulk(self) -> Dict[str, Dict[str, float]]:
-        """Return latest-run site weights as {site_id: {model_name: weight}}."""
+    def get_site_weights_bulk(self) -> Dict[Tuple[str, str], Dict[str, float]]:
+        """Return latest-run weights as {(site_id, grade): {model_name: weight}}."""
         latest_run_id = self._get_latest_calibration_run_id()
         if latest_run_id is None:
             return {}
 
         rows = self.conn.execute(
-            "SELECT site_id, model_name, weight "
+            "SELECT site_id, grade, model_name, weight "
             "FROM calibration_weights "
             "WHERE run_id = ?",
             (latest_run_id,),
         ).fetchall()
-        result: Dict[str, Dict[str, float]] = {}
-        for site_id, model_name, weight in rows:
-            result.setdefault(str(site_id), {})[str(model_name)] = float(weight)
+        result: Dict[Tuple[str, str], Dict[str, float]] = {}
+        for site_id, grade, model_name, weight in rows:
+            key = (str(site_id), str(grade or "ALL"))
+            result.setdefault(key, {})[str(model_name)] = float(weight)
         return result
 
     def get_interval_factors(self, segment: str) -> Optional[Dict]:
@@ -769,12 +855,13 @@ class FuelDatabase:
             "created_at": row[6],
         }
 
-    def get_grade_cohort_stats(self) -> dict:
+    def get_grade_cohort_stats(self, end_date: Optional[str] = None) -> dict:
         """Per-grade cohort max/min monthly volume from mature sites (>=12 months).
 
         Returns:
             {grade: {"cohort_monthly_max": float, "cohort_monthly_min": float}}
         """
+        date_filter = "AND day <= ?" if end_date else ""
         query = """
         WITH monthly AS (
             SELECT site_id, grade,
@@ -782,6 +869,7 @@ class FuelDatabase:
                    SUM(volume) AS monthly_vol
             FROM sales
             WHERE COALESCE(is_estimated, 0) = 0
+              {date_filter}
             GROUP BY site_id, grade, ym
         ),
         mature_sites AS (
@@ -802,8 +890,9 @@ class FuelDatabase:
                MIN(monthly_vol) AS cohort_monthly_min
         FROM mature_monthly
         GROUP BY grade
-        """
-        rows = self.conn.execute(query).fetchall()
+        """.format(date_filter=date_filter)
+        params = (end_date,) if end_date else ()
+        rows = self.conn.execute(query, params).fetchall()
         result = {}
         for grade, cmax, cmin in rows:
             result[grade] = {
@@ -812,12 +901,13 @@ class FuelDatabase:
             }
         return result
 
-    def get_site_monthly_stats(self) -> dict:
+    def get_site_monthly_stats(self, end_date: Optional[str] = None) -> dict:
         """Per (site_id, grade) monthly volume stats.
 
         Returns:
             {(site_id, grade): {"months_count": int, "site_monthly_max": float, "site_monthly_min": float}}
         """
+        date_filter = "AND day <= ?" if end_date else ""
         query = """
         WITH monthly AS (
             SELECT site_id, grade,
@@ -825,6 +915,7 @@ class FuelDatabase:
                    SUM(volume) AS monthly_vol
             FROM sales
             WHERE COALESCE(is_estimated, 0) = 0
+              {date_filter}
             GROUP BY site_id, grade, ym
         )
         SELECT site_id, grade,
@@ -833,8 +924,9 @@ class FuelDatabase:
                MIN(CASE WHEN monthly_vol > 0 THEN monthly_vol END) AS site_monthly_min
         FROM monthly
         GROUP BY site_id, grade
-        """
-        rows = self.conn.execute(query).fetchall()
+        """.format(date_filter=date_filter)
+        params = (end_date,) if end_date else ()
+        rows = self.conn.execute(query, params).fetchall()
         result = {}
         for site_id, grade, mcount, smax, smin in rows:
             result[(str(site_id), str(grade))] = {

@@ -485,7 +485,7 @@ class TestAdaptiveWeights:
         assert ensemble_vol == pytest.approx(expected)
 
     def test_adaptive_weights_used_when_calibrated(self, db):
-        """When calibration data exists, site-specific weights should be used."""
+        """When calibration data exists for this horizon, weights should be used."""
         # Store calibration: site 100 gets 50/50
         run_id = db.save_calibration_run({
             "backtest_months": 6, "horizon": 2,
@@ -506,6 +506,53 @@ class TestAdaptiveWeights:
         ensemble_vol = individual["ENSEMBLE"]
         expected = (individual["ets"] * 0.50 + individual["snaive"] * 0.50)
         assert ensemble_vol == pytest.approx(expected)
+
+    def test_site_grade_weights_preferred(self, db):
+        """Grade-specific weights should override site-level fallback weights."""
+        run_id = db.save_calibration_run({
+            "backtest_months": 6, "horizon": 2,
+            "min_months": 24, "sites_calibrated": 1, "overall_mape": 5.0,
+        })
+        db.save_site_weights(run_id, [
+            {"site_id": "100", "grade": "ALL", "model_name": "ets", "weight": 0.90},
+            {"site_id": "100", "grade": "ALL", "model_name": "snaive", "weight": 0.10},
+            {"site_id": "100", "grade": "UNL", "model_name": "ets", "weight": 0.20},
+            {"site_id": "100", "grade": "UNL", "model_name": "snaive", "weight": 0.80},
+        ])
+
+        fc = FuelForecaster(db, min_months_data=24, use_adaptive_weights=True)
+        forecast = fc.generate_forecast(
+            target_month="2025-03", site_id="100", grade="UNL", show_yoy=False,
+        )
+        individual = forecast.set_index("model")["forecast_volume"]
+        expected = individual["ets"] * 0.20 + individual["snaive"] * 0.80
+        assert individual["ENSEMBLE"] == pytest.approx(expected)
+
+    def test_horizon_mismatch_uses_defaults(self, db):
+        """Calibration from another horizon should not affect the forecast."""
+        run_id = db.save_calibration_run({
+            "backtest_months": 6, "horizon": 1,
+            "min_months": 24, "sites_calibrated": 1, "overall_mape": 5.0,
+        })
+        db.save_site_weights(run_id, [
+            {"site_id": "100", "model_name": "ets", "weight": 0.10},
+            {"site_id": "100", "model_name": "snaive", "weight": 0.90},
+        ])
+        db.save_interval_calibration(run_id, [
+            {"segment": "site:100", "residual_std": 0.08,
+             "residual_p10": -0.10, "residual_p90": 0.12, "n_observations": 12},
+        ])
+
+        fc = FuelForecaster(db, min_months_data=24, use_adaptive_weights=True)
+        forecast = fc.generate_forecast(
+            target_month="2025-03", site_id="100", show_yoy=False,
+        )
+        individual = forecast.set_index("model")["forecast_volume"]
+        ensemble = forecast[forecast["model"] == "ENSEMBLE"].iloc[0]
+        expected_default = individual["ets"] * 0.7 + individual["snaive"] * 0.3
+        assert individual["ENSEMBLE"] == pytest.approx(expected_default)
+        assert pd.isna(ensemble["forecast_p10"])
+        assert "Calibration horizon 1" in ensemble["note"]
 
     def test_no_calibration_flag_forces_defaults(self, db):
         """use_adaptive_weights=False should ignore stored calibration."""
@@ -561,6 +608,14 @@ class TestPredictionIntervals:
         assert not pd.isna(ensemble["forecast_p90"])
         assert ensemble["forecast_p10"] < ensemble["forecast_volume"]
         assert ensemble["forecast_p90"] > ensemble["forecast_volume"]
+
+        forecast_volume = float(ensemble["forecast_volume"])
+        assert ensemble["forecast_p10"] == pytest.approx(
+            round(forecast_volume / (1 + 0.12), 1)
+        )
+        assert ensemble["forecast_p90"] == pytest.approx(
+            round(forecast_volume / (1 - 0.10), 1)
+        )
 
     def test_interval_fallback_to_global(self, db):
         """When site-level intervals are missing, should fall back to global."""

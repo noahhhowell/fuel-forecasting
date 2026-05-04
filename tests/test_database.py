@@ -291,10 +291,10 @@ class TestCalibrationCRUD:
         assert rows_written == 4
 
         bulk = db.get_site_weights_bulk()
-        assert "100" in bulk
-        assert bulk["100"]["ets"] == 0.65
-        assert bulk["100"]["snaive"] == 0.35
-        assert "200" in bulk
+        assert ("100", "ALL") in bulk
+        assert bulk[("100", "ALL")]["ets"] == 0.65
+        assert bulk[("100", "ALL")]["snaive"] == 0.35
+        assert ("200", "ALL") in bulk
 
     def test_save_and_get_interval_calibration(self, db):
         """Should save and retrieve interval calibration factors."""
@@ -347,7 +347,7 @@ class TestCalibrationCRUD:
              "mape_pct": 3.0, "n_months": 8},
         ])
         bulk = db.get_site_weights_bulk()
-        assert bulk["100"]["ets"] == 0.80
+        assert bulk[("100", "ALL")]["ets"] == 0.80
 
     def test_get_site_weights_bulk_latest_run_only(self, db):
         """Weight lookup should only return rows from the latest calibration run."""
@@ -374,8 +374,111 @@ class TestCalibrationCRUD:
         ])
 
         bulk = db.get_site_weights_bulk()
-        assert "200" in bulk
-        assert "100" not in bulk
+        assert ("200", "ALL") in bulk
+        assert ("100", "ALL") not in bulk
+
+    def test_site_grade_weights_are_distinct(self, db):
+        """Weights are scoped by both site and grade."""
+        run_id = db.save_calibration_run({
+            "backtest_months": 6, "horizon": 2,
+            "min_months": 24, "sites_calibrated": 1, "overall_mape": 5.0,
+        })
+        db.save_site_weights(run_id, [
+            {"site_id": "100", "grade": "UNL", "model_name": "ets", "weight": 0.80},
+            {"site_id": "100", "grade": "DSL", "model_name": "ets", "weight": 0.30},
+        ])
+
+        bulk = db.get_site_weights_bulk()
+        assert bulk[("100", "UNL")]["ets"] == 0.80
+        assert bulk[("100", "DSL")]["ets"] == 0.30
+
+    def test_legacy_calibration_tables_migrate(self, tmp_path):
+        """Old calibration tables should upgrade to run/grade-scoped keys."""
+        db_path = tmp_path / "legacy_calibration.db"
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(
+                """
+                CREATE TABLE calibration_runs (
+                    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    backtest_months INTEGER,
+                    horizon INTEGER,
+                    min_months INTEGER,
+                    sites_calibrated INTEGER,
+                    overall_mape REAL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE calibration_weights (
+                    site_id TEXT NOT NULL,
+                    model_name TEXT NOT NULL,
+                    weight REAL NOT NULL,
+                    mape_pct REAL,
+                    n_months INTEGER,
+                    run_id INTEGER NOT NULL REFERENCES calibration_runs(run_id),
+                    PRIMARY KEY (site_id, model_name)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE interval_calibration (
+                    segment TEXT NOT NULL PRIMARY KEY,
+                    residual_std REAL NOT NULL,
+                    residual_p10 REAL NOT NULL,
+                    residual_p90 REAL NOT NULL,
+                    n_observations INTEGER,
+                    run_id INTEGER NOT NULL REFERENCES calibration_runs(run_id)
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO calibration_runs "
+                "(run_id, backtest_months, horizon, min_months, sites_calibrated, overall_mape) "
+                "VALUES (1, 6, 2, 24, 1, 5.0)"
+            )
+            conn.execute(
+                "INSERT INTO calibration_weights "
+                "(site_id, model_name, weight, mape_pct, n_months, run_id) "
+                "VALUES ('100', 'ets', 0.7, 5.0, 6, 1)"
+            )
+            conn.execute(
+                "INSERT INTO interval_calibration "
+                "(segment, residual_std, residual_p10, residual_p90, n_observations, run_id) "
+                "VALUES ('global', 0.1, -0.2, 0.2, 10, 1)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        migrated = FuelDatabase(str(db_path))
+        try:
+            weight_pk = [
+                row[1]
+                for row in sorted(
+                    migrated.conn.execute("PRAGMA table_info(calibration_weights)"),
+                    key=lambda row: row[5],
+                )
+                if row[5]
+            ]
+            interval_pk = [
+                row[1]
+                for row in sorted(
+                    migrated.conn.execute("PRAGMA table_info(interval_calibration)"),
+                    key=lambda row: row[5],
+                )
+                if row[5]
+            ]
+
+            assert weight_pk == ["run_id", "site_id", "grade", "model_name"]
+            assert interval_pk == ["run_id", "segment"]
+            assert migrated.get_site_weights_bulk()[("100", "ALL")]["ets"] == 0.7
+            assert migrated.get_interval_factors("global")["residual_p90"] == 0.2
+        finally:
+            migrated.close()
 
     def test_get_interval_factors_latest_run_only(self, db):
         """Interval lookup should only read factors from the latest run."""

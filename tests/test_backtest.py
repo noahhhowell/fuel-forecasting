@@ -10,9 +10,11 @@ from backtest import (
     run_backtest,
     _run_backtest_inner,
     _parse_max_date,
+    _prior_year_known_by_cutoff,
     MAPE_GOOD_THRESHOLD,
     MAPE_ACCEPTABLE_THRESHOLD,
 )
+from forecaster import FuelForecaster
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +118,15 @@ class TestParseMaxDate:
             _parse_max_date({"date_range": "2024-12-31"})
 
 
+class TestPriorYearKnownByCutoff:
+
+    def test_known_when_prior_year_month_ends_before_cutoff(self):
+        assert _prior_year_known_by_cutoff("2025-04", "2025-01-31") is True
+
+    def test_not_known_when_prior_year_month_is_after_cutoff(self):
+        assert _prior_year_known_by_cutoff("2025-04", "2024-01-31") is False
+
+
 # ---------------------------------------------------------------------------
 # run_backtest integration
 # ---------------------------------------------------------------------------
@@ -204,6 +215,19 @@ class TestRunBacktest:
         )
         assert len(result) == 2
 
+    def test_scores_post_cap_forecast(self, db, monkeypatch):
+        """Backtest should score the post-processed production forecast."""
+        def force_cap(self, forecast_df, sanity_bounds, monthly_data_raw):
+            capped = forecast_df.copy()
+            capped.loc[capped["model"] == "ENSEMBLE", "forecast_volume"] = 1.0
+            return capped
+
+        monkeypatch.setattr(FuelForecaster, "_apply_caps_to_forecast_df", force_cap)
+        results_df, _ = run_backtest(
+            db_path=db.db_path, months=1, min_months=12, horizon=1,
+        )
+        assert (results_df["forecast"] == 1.0).all()
+
 
 # ---------------------------------------------------------------------------
 # build_per_model_site_metrics
@@ -226,6 +250,26 @@ class TestBuildPerModelSiteMetrics:
         ets_100 = metrics[(metrics["site_id"] == "100") & (metrics["model"] == "ets")]
         assert ets_100["mape_pct"].iloc[0] == pytest.approx(6.0)
         assert ets_100["n_months"].iloc[0] == 2
+
+    def test_groups_by_site_grade_and_model_when_grade_present(self):
+        """Grade-level per-model metrics should not collapse to site level."""
+        df = pd.DataFrame([
+            {"site_id": "100", "grade": "UNL", "model": "ets", "error_pct": 5.0},
+            {"site_id": "100", "grade": "DSL", "model": "ets", "error_pct": 15.0},
+            {"site_id": "100", "grade": "UNL", "model": "snaive", "error_pct": 8.0},
+        ])
+        metrics = build_per_model_site_metrics(df)
+
+        assert {"site_id", "grade", "model", "mape_pct", "n_months"}.issubset(
+            metrics.columns
+        )
+        assert len(metrics) == 3
+        unl_ets = metrics[
+            (metrics["site_id"] == "100")
+            & (metrics["grade"] == "UNL")
+            & (metrics["model"] == "ets")
+        ]
+        assert unl_ets["mape_pct"].iloc[0] == pytest.approx(5.0)
 
     def test_empty_input(self):
         """Empty input should return empty DataFrame with correct schema."""

@@ -9,7 +9,7 @@ The system combines two forecasting models into a single **ENSEMBLE** prediction
 1. **ETS** (Holt-Winters) — Exponential smoothing that captures trend and seasonality.
 2. **Seasonal Naive** — Uses same-month-last-year values as the forecast.
 
-By default, the ensemble uses fixed weights (70% ETS, 30% Seasonal Naive). If you run **calibration** first, the system learns the best weight for each site based on which model has been more accurate there historically. See the [Calibration](#calibration) section for details.
+By default, the ensemble uses fixed weights (70% ETS, 30% Seasonal Naive). If you run **calibration** first, the system learns weights for each site-grade combination based on which model has been more accurate there historically. See the [Calibration](#calibration) section for details.
 
 The **ENSEMBLE** forecast is what you should use for decisions. Individual model outputs (ets, snaive) are included in exports for transparency.
 
@@ -121,7 +121,7 @@ python cli.py forecast 2026-03 --output forecasts/2026-03.xlsx
 python cli.py forecast 2026-03 --output forecasts/2026-03.csv
 ```
 
-If calibration has been run, forecasts automatically use the calibrated per-site weights. To force the default fixed weights instead, add `--no-calibration`:
+If calibration has been run for the same forecast horizon, forecasts automatically use the calibrated site-grade weights. To force the default fixed weights instead, add `--no-calibration`:
 
 ```bash
 python cli.py forecast 2026-03 --no-calibration
@@ -140,15 +140,17 @@ python cli.py forecast 2026-03 --no-calibration
 
 ## Calibration
 
-Calibration teaches the system which model works best for each site. Without calibration, every site gets the same 70/30 ETS/Seasonal Naive blend. After calibration, each site gets its own optimized weights based on historical accuracy.
+Calibration teaches the system which model works best for each site-grade combination. Without calibration, every forecast gets the same 70/30 ETS/Seasonal Naive blend. After calibration, each site-grade forecast unit gets its own weights based on historical accuracy.
 
 ### What It Does
 
-1. **Backtests** all sites over recent months to measure each model's accuracy per site.
-2. **Computes per-site weights** using inverse-MAPE scoring — models that were more accurate get more weight. Every model is guaranteed at least a 10% floor so no model is completely ignored.
-3. **Applies shrinkage** for sites with limited data — if a site has fewer than 6 backtest months, its weights are blended toward the global average to avoid overfitting to a small sample.
-4. **Builds prediction intervals** by measuring how far off past forecasts were (residual distributions), which can be used for confidence ranges.
-5. **Stores everything** in the database, tagged with a run ID. Only the latest calibration run is used for forecasting — older runs are kept in the database but never mixed into new forecasts.
+1. **Backtests** all site-grade combinations over recent months to measure each model's accuracy at the same grain used for production forecasts.
+2. **Computes site-grade weights** using inverse-MAPE scoring; models that were more accurate get more weight. Every model is guaranteed at least a 10% floor so no model is completely ignored.
+3. **Applies shrinkage** for forecast units with limited data; if a site-grade has fewer than 6 backtest months, its weights are blended toward the global average to avoid overfitting to a small sample.
+4. **Builds prediction intervals** by measuring how far off past forecasts were (residual distributions). Intervals are only applied when the forecast horizon matches the latest calibration run.
+5. **Stores everything** in the database, tagged with a run ID. Only the latest calibration run is used for forecasting; older runs are kept in the database but never mixed into new forecasts.
+
+If a forecast is changed by a sanity cap or YoY guardrail, interval columns are left blank for that row because post-hoc capped intervals no longer have calibrated coverage.
 
 ### Running Calibration
 
@@ -169,7 +171,7 @@ python cli.py calibrate --output calibration_report.xlsx
 |------|---------|--------------|
 | `--months` | 12 | Number of recent months to backtest |
 | `--min-months` | 24 | Minimum months of data required before the backtest window |
-| `--horizon` | 2 | How many months ahead to forecast in each backtest step |
+| `--horizon` | 2 | Business lead-time horizon for each backtest step; because only complete months are used for training, this maps to one additional model forecast step |
 | `--weight-floor` | 0.10 | Minimum weight any model can receive (prevents dropping a model entirely) |
 | `--output` | None | Save calibration report to an Excel file |
 
@@ -179,9 +181,9 @@ When you use `--output`, the Excel report contains three sheets:
 
 | Sheet | Contents |
 |-------|----------|
-| Weights | Per-site model weights (site_id, model_name, weight, mape_pct, n_months) |
-| Per-Model MAPE | Backtest accuracy for each model at each site |
-| Interval Calibration | Residual distribution stats (std, p10, p90) per site and globally |
+| Weights | Site-grade model weights (site_id, grade, model_name, weight, mape_pct, n_months) |
+| Per-Model MAPE | Backtest accuracy for each model at each site-grade |
+| Interval Calibration | Residual distribution stats (std, p10, p90) per site-grade, site, grade, and globally |
 
 ### Input Validation
 
@@ -252,7 +254,7 @@ python backtest.py --months 12 --output backtest_results.xlsx
 python backtest.py --horizon 3
 ```
 
-Holds out recent months, generates forecasts using only prior data, and reports:
+Holds out recent months, generates forecasts using only prior data, applies the same production sanity caps and YoY guardrails, and reports:
 - MAPE (mean absolute percentage error) per site
 - Median APE across all site-month rows
 - Trimmed MAPE (per-site mean after dropping each site's single worst month)
@@ -270,7 +272,7 @@ python cli.py load --directory ./data
 # 2. Check data quality
 python cli.py status --detailed
 
-# 3. Run calibration to learn per-site weights
+# 3. Run calibration to learn site-grade weights
 python cli.py calibrate --output calibration_report.xlsx
 
 # 4. Generate forecasts (uses calibrated weights automatically)
@@ -376,6 +378,6 @@ Run PowerShell as Administrator.
 | `fuel_sales.db` | SQLite database (auto-created on first load) |
 | `data/` | Put PDI Excel/CSV exports here |
 | `forecasts/` | Forecast output files |
-| `calibrate.py` | Calibration module (learns per-site weights) |
+| `calibrate.py` | Calibration module (learns site-grade weights) |
 | `backtest.py` | Backtesting module (evaluates forecast accuracy) |
 | `tests/` | Automated test suite (run with `uv run pytest`) |

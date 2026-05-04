@@ -9,6 +9,7 @@ from backtest import (
     build_per_model_site_metrics,
     run_backtest,
     _run_backtest_inner,
+    _compute_error_fields,
     _parse_max_date,
     _prior_year_known_by_cutoff,
     MAPE_GOOD_THRESHOLD,
@@ -37,9 +38,57 @@ class TestBuildSiteErrorMetrics:
 
         expected_cols = {
             "site_id", "mape_pct", "median_ape_pct",
-            "trimmed_mape_pct", "max_ape_pct", "n_months", "rating",
+            "trimmed_mape_pct", "max_ape_pct", "me", "mpe",
+            "n_months", "rating",
         }
         assert expected_cols.issubset(site_metrics.columns)
+
+    def test_signed_bias_metrics_preserve_overforecast_sign(self):
+        """ME/MPE should stay positive when forecasts are above actuals."""
+        actuals = [1000.0, 2000.0, 4000.0]
+        rows = []
+        for idx, actual in enumerate(actuals, start=1):
+            forecast = actual + 100.0
+            rows.append({
+                "site_id": "100",
+                "month": f"2025-{idx:02d}",
+                "forecast": forecast,
+                "actual": actual,
+            })
+
+        site_metrics = build_site_error_metrics(pd.DataFrame(rows)).iloc[0]
+        expected_mpe = np.mean([(100.0 / actual) * 100 for actual in actuals])
+
+        assert site_metrics["me"] == pytest.approx(100.0)
+        assert site_metrics["mpe"] == pytest.approx(expected_mpe)
+        assert site_metrics["mape_pct"] > 0
+        assert np.isfinite(site_metrics["mape_pct"])
+
+    def test_me_keeps_zero_actual_rows_while_mpe_drops_them(self):
+        """ME is defined for zero actuals; percentage metrics are not."""
+        rows = [
+            {
+                "site_id": "100",
+                "month": "2025-01",
+                "forecast": 100.0,
+                "actual": 0.0,
+                **_compute_error_fields(100.0, 0.0),
+            },
+            {
+                "site_id": "100",
+                "month": "2025-02",
+                "forecast": 300.0,
+                "actual": 200.0,
+                **_compute_error_fields(300.0, 200.0),
+            },
+        ]
+
+        site_metrics = build_site_error_metrics(pd.DataFrame(rows)).iloc[0]
+
+        assert site_metrics["me"] == pytest.approx(100.0)
+        assert site_metrics["mpe"] == pytest.approx(50.0)
+        assert site_metrics["mape_pct"] == pytest.approx(50.0)
+        assert site_metrics["n_months"] == 1
 
     def test_trimmed_mape_drops_single_worst_month(self):
         """Trimmed MAPE should reduce sensitivity to one catastrophic month."""
@@ -141,9 +190,10 @@ class TestRunBacktest:
 
         assert results_df is not None
         assert not results_df.empty
-        assert {"site_id", "month", "forecast", "actual", "error_pct"}.issubset(
-            results_df.columns
-        )
+        assert {
+            "site_id", "month", "forecast", "actual", "error",
+            "pct_error", "error_pct",
+        }.issubset(results_df.columns)
 
         assert site_mape is not None
         assert not site_mape.empty
@@ -157,6 +207,16 @@ class TestRunBacktest:
         if results_df is not None:
             assert (results_df["error_pct"] >= 0).all()
 
+    def test_prints_overall_bias_metrics(self, db, capsys):
+        """Console summary should include overall ME and MPE next to MAPE."""
+        run_backtest(
+            db_path=db.db_path, months=1, min_months=12, horizon=1,
+        )
+        output = capsys.readouterr().out
+        assert "Overall MAPE:" in output
+        assert "Overall ME:" in output
+        assert "Overall MPE:" in output
+
     def test_excel_output(self, db, tmp_path):
         """Excel export should create a file with expected sheets."""
         out = str(tmp_path / "bt.xlsx")
@@ -167,6 +227,14 @@ class TestRunBacktest:
         assert "Results" in xl.sheet_names
         assert "Summary" in xl.sheet_names
         assert "Site MAPE" in xl.sheet_names
+
+        results = pd.read_excel(out, sheet_name="Results")
+        summary = pd.read_excel(out, sheet_name="Summary")
+        site_mape = pd.read_excel(out, sheet_name="Site MAPE")
+
+        assert {"error", "pct_error"}.issubset(results.columns)
+        assert {"overall_me", "overall_mpe_pct"}.issubset(set(summary["metric"]))
+        assert {"me", "mpe"}.issubset(site_mape.columns)
 
     def test_invalid_months_raises(self):
         with pytest.raises(ValueError, match="months must be >= 1"):
@@ -205,7 +273,9 @@ class TestRunBacktest:
         assert per_model_df is not None
         assert not per_model_df.empty
         assert {"site_id", "month", "model", "forecast", "actual",
-                "error_pct", "residual"}.issubset(per_model_df.columns)
+                "error", "pct_error", "error_pct", "residual"}.issubset(
+                    per_model_df.columns
+                )
 
     def test_return_per_model_false_returns_pair(self, db):
         """return_per_model=False (default) should return a 2-tuple."""
@@ -245,11 +315,36 @@ class TestBuildPerModelSiteMetrics:
         ])
         metrics = build_per_model_site_metrics(df)
         assert len(metrics) == 3
-        assert {"site_id", "model", "mape_pct", "n_months"}.issubset(metrics.columns)
+        assert {"site_id", "model", "mape_pct", "me", "mpe", "n_months"}.issubset(
+            metrics.columns
+        )
 
         ets_100 = metrics[(metrics["site_id"] == "100") & (metrics["model"] == "ets")]
         assert ets_100["mape_pct"].iloc[0] == pytest.approx(6.0)
         assert ets_100["n_months"].iloc[0] == 2
+
+    def test_signed_bias_metrics_by_model(self):
+        """Per-model ME/MPE should preserve the forecast-minus-actual sign."""
+        df = pd.DataFrame([
+            {
+                "site_id": "100",
+                "model": "ets",
+                "forecast": 1100.0,
+                "actual": 1000.0,
+            },
+            {
+                "site_id": "100",
+                "model": "ets",
+                "forecast": 2100.0,
+                "actual": 2000.0,
+            },
+        ])
+
+        metrics = build_per_model_site_metrics(df).iloc[0]
+
+        assert metrics["me"] == pytest.approx(100.0)
+        assert metrics["mpe"] == pytest.approx(7.5)
+        assert metrics["mape_pct"] == pytest.approx(7.5)
 
     def test_groups_by_site_grade_and_model_when_grade_present(self):
         """Grade-level per-model metrics should not collapse to site level."""
@@ -260,9 +355,9 @@ class TestBuildPerModelSiteMetrics:
         ])
         metrics = build_per_model_site_metrics(df)
 
-        assert {"site_id", "grade", "model", "mape_pct", "n_months"}.issubset(
-            metrics.columns
-        )
+        assert {
+            "site_id", "grade", "model", "mape_pct", "me", "mpe", "n_months",
+        }.issubset(metrics.columns)
         assert len(metrics) == 3
         unl_ets = metrics[
             (metrics["site_id"] == "100")

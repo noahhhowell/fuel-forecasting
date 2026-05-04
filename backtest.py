@@ -33,6 +33,89 @@ MAPE_GOOD_THRESHOLD = 5
 MAPE_ACCEPTABLE_THRESHOLD = 10
 
 
+def _finite_mean(values: pd.Series) -> float:
+    """Return the mean of finite numeric values, or NaN when none exist."""
+    numeric = pd.to_numeric(values, errors="coerce")
+    finite = numeric[np.isfinite(numeric)]
+    if finite.empty:
+        return np.nan
+    return float(finite.mean())
+
+
+def _round_finite(value: float, digits: int) -> float:
+    """Round finite values while preserving NaN/inf sentinels."""
+    if not np.isfinite(value):
+        return value
+    return round(float(value), digits)
+
+
+def _compute_error_fields(forecast: float, actual: float) -> dict:
+    """
+    Compute row-level forecast error fields.
+
+    error is signed volume error: forecast - actual. pct_error is the signed
+    percentage error, so positive error/ME/MPE means over-forecasting. When
+    actual is zero, pct_error and error_pct are undefined and left as NaN; the
+    signed volume error is still valid and should be included in ME.
+    """
+    forecast = float(forecast)
+    actual = float(actual)
+    error = forecast - actual
+
+    if actual == 0:
+        return {
+            "error": error,
+            "pct_error": np.nan,
+            "error_pct": np.nan,
+            "residual": np.nan,
+        }
+
+    pct_error = error / actual * 100
+    return {
+        "error": error,
+        "pct_error": pct_error,
+        "error_pct": abs(pct_error),
+        "residual": error / actual,
+    }
+
+
+def _coerce_error_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Coerce or derive metric columns needed for MAPE, ME, and MPE."""
+    clean = df.copy()
+
+    derived_error = None
+    derived_pct_error = None
+    if {"forecast", "actual"}.issubset(clean.columns):
+        forecast = pd.to_numeric(clean["forecast"], errors="coerce")
+        actual = pd.to_numeric(clean["actual"], errors="coerce")
+        derived_error = forecast - actual
+        derived_pct_error = pd.Series(np.nan, index=clean.index, dtype=float)
+        pct_mask = actual.notna() & (actual != 0)
+        derived_pct_error.loc[pct_mask] = (
+            derived_error.loc[pct_mask] / actual.loc[pct_mask] * 100
+        )
+
+    residual_pct_error = None
+    if "residual" in clean.columns:
+        residual_pct_error = pd.to_numeric(clean["residual"], errors="coerce") * 100
+
+    for col in ("error_pct", "error", "pct_error"):
+        if col not in clean.columns:
+            clean[col] = np.nan
+        clean[col] = pd.to_numeric(clean[col], errors="coerce")
+
+    if derived_error is not None:
+        clean["error"] = clean["error"].fillna(derived_error)
+
+    if derived_pct_error is not None:
+        clean["pct_error"] = clean["pct_error"].fillna(derived_pct_error)
+    if residual_pct_error is not None:
+        clean["pct_error"] = clean["pct_error"].fillna(residual_pct_error)
+
+    clean["error_pct"] = clean["error_pct"].fillna(clean["pct_error"].abs()).abs()
+    return clean
+
+
 def _validate_month_params(months: int, min_months: int, horizon: int) -> None:
     """Shared month/horizon validation used by backtest and calibration."""
     if months < 1:
@@ -84,62 +167,91 @@ def build_site_error_metrics(results_df: pd.DataFrame) -> pd.DataFrame:
     """
     Build per-site error metrics including robust measures.
 
+    ME/MPE are signed bias metrics: positive values mean over-forecasting.
+    MAPE and MPE exclude rows where actual is zero; ME includes them.
+
     Returns columns:
-      site_id, mape_pct, median_ape_pct, trimmed_mape_pct, max_ape_pct, n_months, rating
+      site_id, mape_pct, me, mpe, median_ape_pct, trimmed_mape_pct,
+      max_ape_pct, n_months, rating
     """
+    columns = [
+        "site_id",
+        "mape_pct",
+        "me",
+        "mpe",
+        "median_ape_pct",
+        "trimmed_mape_pct",
+        "max_ape_pct",
+        "n_months",
+        "rating",
+    ]
     if results_df.empty:
-        return pd.DataFrame(
-            columns=[
-                "site_id",
-                "mape_pct",
-                "median_ape_pct",
-                "trimmed_mape_pct",
-                "max_ape_pct",
-                "n_months",
-                "rating",
-            ]
-        )
+        return pd.DataFrame(columns=columns)
 
-    clean = results_df.copy()
-    clean["error_pct"] = pd.to_numeric(clean["error_pct"], errors="coerce")
-    clean = clean[np.isfinite(clean["error_pct"])].copy()
+    clean = _coerce_error_columns(results_df)
+    clean = clean[
+        np.isfinite(clean[["error_pct", "error", "pct_error"]]).any(axis=1)
+    ].copy()
     if clean.empty:
-        return pd.DataFrame(
-            columns=[
-                "site_id",
-                "mape_pct",
-                "median_ape_pct",
-                "trimmed_mape_pct",
-                "max_ape_pct",
-                "n_months",
-                "rating",
-            ]
-        )
+        return pd.DataFrame(columns=columns)
 
-    grouped = clean.groupby("site_id")["error_pct"]
-    site_metrics = (
-        grouped.agg(
-            mape_pct="mean",
-            median_ape_pct="median",
-            max_ape_pct="max",
-            n_months="count",
-        )
-        .reset_index()
-    )
+    site_metrics = clean.groupby("site_id").size().reset_index(name="_rows")
+    site_metrics = site_metrics.drop(columns="_rows")
 
-    trimmed = (
-        grouped.apply(_trimmed_mean_drop_worst)
-        .reset_index(name="trimmed_mape_pct")
+    pct_clean = clean[np.isfinite(clean["error_pct"])]
+    if not pct_clean.empty:
+        grouped = pct_clean.groupby("site_id")["error_pct"]
+        mape_metrics = (
+            grouped.agg(
+                mape_pct="mean",
+                median_ape_pct="median",
+                max_ape_pct="max",
+                n_months="count",
+            )
+            .reset_index()
+        )
+        trimmed = (
+            grouped.apply(_trimmed_mean_drop_worst)
+            .reset_index(name="trimmed_mape_pct")
+        )
+        site_metrics = site_metrics.merge(mape_metrics, on="site_id", how="left")
+        site_metrics = site_metrics.merge(trimmed, on="site_id", how="left")
+    else:
+        site_metrics["mape_pct"] = np.nan
+        site_metrics["median_ape_pct"] = np.nan
+        site_metrics["max_ape_pct"] = np.nan
+        site_metrics["n_months"] = 0
+        site_metrics["trimmed_mape_pct"] = np.nan
+
+    error_clean = clean[np.isfinite(clean["error"])]
+    if not error_clean.empty:
+        me = error_clean.groupby("site_id")["error"].mean().reset_index(name="me")
+        site_metrics = site_metrics.merge(me, on="site_id", how="left")
+    else:
+        site_metrics["me"] = np.nan
+
+    signed_pct_clean = clean[np.isfinite(clean["pct_error"])]
+    if not signed_pct_clean.empty:
+        mpe = (
+            signed_pct_clean.groupby("site_id")["pct_error"]
+            .mean()
+            .reset_index(name="mpe")
+        )
+        site_metrics = site_metrics.merge(mpe, on="site_id", how="left")
+    else:
+        site_metrics["mpe"] = np.nan
+
+    site_metrics["n_months"] = site_metrics["n_months"].fillna(0).astype(int)
+    site_metrics = site_metrics.sort_values(
+        "mape_pct", ascending=False, na_position="last"
     )
-    site_metrics = site_metrics.merge(trimmed, on="site_id", how="left")
-    site_metrics = site_metrics.sort_values("mape_pct", ascending=False)
 
     site_metrics["rating"] = pd.cut(
         site_metrics["mape_pct"],
         bins=[-np.inf, MAPE_GOOD_THRESHOLD, MAPE_ACCEPTABLE_THRESHOLD, np.inf],
         labels=["Good", "Acceptable", "Review"],
     )
-    return site_metrics
+    return site_metrics[columns]
 
 
 def _parse_max_date(stats: dict) -> pd.Timestamp:
@@ -156,17 +268,29 @@ def build_per_model_site_metrics(per_model_df: pd.DataFrame) -> pd.DataFrame:
     """
     Build per-site(/grade) per-model error metrics.
 
-    Returns columns: site_id, [grade,] model, mape_pct, n_months
+    ME/MPE are signed bias metrics: positive values mean over-forecasting.
+    MAPE and MPE exclude rows where actual is zero; ME includes them.
+
+    Returns columns: site_id, [grade,] model, mape_pct, me, mpe, n_months
     """
-    base_columns = ["site_id", "model", "mape_pct", "n_months"]
+    base_columns = ["site_id", "model", "mape_pct", "me", "mpe", "n_months"]
     if "grade" in per_model_df.columns:
-        base_columns = ["site_id", "grade", "model", "mape_pct", "n_months"]
+        base_columns = [
+            "site_id",
+            "grade",
+            "model",
+            "mape_pct",
+            "me",
+            "mpe",
+            "n_months",
+        ]
     if per_model_df.empty:
         return pd.DataFrame(columns=base_columns)
 
-    clean = per_model_df.copy()
-    clean["error_pct"] = pd.to_numeric(clean["error_pct"], errors="coerce")
-    clean = clean[np.isfinite(clean["error_pct"])].copy()
+    clean = _coerce_error_columns(per_model_df)
+    clean = clean[
+        np.isfinite(clean[["error_pct", "error", "pct_error"]]).any(axis=1)
+    ].copy()
     if clean.empty:
         return pd.DataFrame(columns=base_columns)
 
@@ -174,11 +298,41 @@ def build_per_model_site_metrics(per_model_df: pd.DataFrame) -> pd.DataFrame:
     if "grade" in clean.columns:
         group_cols = ["site_id", "grade", "model"]
 
-    return (
-        clean.groupby(group_cols)["error_pct"]
-        .agg(mape_pct="mean", n_months="count")
-        .reset_index()
-    )
+    metrics = clean.groupby(group_cols).size().reset_index(name="_rows")
+    metrics = metrics.drop(columns="_rows")
+
+    pct_clean = clean[np.isfinite(clean["error_pct"])]
+    if not pct_clean.empty:
+        mape = (
+            pct_clean.groupby(group_cols)["error_pct"]
+            .agg(mape_pct="mean", n_months="count")
+            .reset_index()
+        )
+        metrics = metrics.merge(mape, on=group_cols, how="left")
+    else:
+        metrics["mape_pct"] = np.nan
+        metrics["n_months"] = 0
+
+    error_clean = clean[np.isfinite(clean["error"])]
+    if not error_clean.empty:
+        me = error_clean.groupby(group_cols)["error"].mean().reset_index(name="me")
+        metrics = metrics.merge(me, on=group_cols, how="left")
+    else:
+        metrics["me"] = np.nan
+
+    signed_pct_clean = clean[np.isfinite(clean["pct_error"])]
+    if not signed_pct_clean.empty:
+        mpe = (
+            signed_pct_clean.groupby(group_cols)["pct_error"]
+            .mean()
+            .reset_index(name="mpe")
+        )
+        metrics = metrics.merge(mpe, on=group_cols, how="left")
+    else:
+        metrics["mpe"] = np.nan
+
+    metrics["n_months"] = metrics["n_months"].fillna(0).astype(int)
+    return metrics[base_columns]
 
 
 def run_backtest(db_path="fuel_sales.db", months=6, output=None, min_months=24,
@@ -262,7 +416,7 @@ def _run_backtest_inner(db, months, output, min_months, horizon,
             target = test_month.strftime("%Y-%m")
 
             actual = get_actual_monthly_volume(db, site_id, target, grade=grade)
-            if actual is None or actual <= 0:
+            if actual is None or not np.isfinite(actual) or actual < 0:
                 continue
 
             cutoff = (test_month - pd.DateOffset(months=horizon, days=1)).strftime("%Y-%m-%d")
@@ -304,15 +458,18 @@ def _run_backtest_inner(db, months, output, min_months, horizon,
                     continue
 
                 forecast_vol = float(ensemble["forecast_volume"].iloc[0])
-                error_pct = abs(forecast_vol - actual) / actual * 100
+                error_fields = _compute_error_fields(forecast_vol, actual)
 
                 results.append({
                     "site_id": site_id,
                     "grade": grade,
+                    "model": "ENSEMBLE",
                     "month": target,
                     "forecast": round(forecast_vol, 1),
                     "actual": round(actual, 1),
-                    "error_pct": round(error_pct, 2),
+                    "error": _round_finite(error_fields["error"], 1),
+                    "pct_error": _round_finite(error_fields["pct_error"], 2),
+                    "error_pct": _round_finite(error_fields["error_pct"], 2),
                 })
 
                 # Collect per-model results when requested
@@ -322,8 +479,7 @@ def _run_backtest_inner(db, months, output, min_months, horizon,
                         if model_name in ("ENSEMBLE", "FALLBACK"):
                             continue
                         model_vol = float(row["forecast_volume"])
-                        model_error = abs(model_vol - actual) / actual * 100
-                        residual = (model_vol - actual) / actual
+                        model_error_fields = _compute_error_fields(model_vol, actual)
                         per_model_results.append({
                             "site_id": site_id,
                             "grade": grade,
@@ -331,8 +487,16 @@ def _run_backtest_inner(db, months, output, min_months, horizon,
                             "model": model_name,
                             "forecast": round(model_vol, 1),
                             "actual": round(actual, 1),
-                            "error_pct": round(model_error, 2),
-                            "residual": round(residual, 4),
+                            "error": _round_finite(model_error_fields["error"], 1),
+                            "pct_error": _round_finite(
+                                model_error_fields["pct_error"], 2
+                            ),
+                            "error_pct": _round_finite(
+                                model_error_fields["error_pct"], 2
+                            ),
+                            "residual": _round_finite(
+                                model_error_fields["residual"], 4
+                            ),
                         })
 
             except (ValueError, KeyError) as e:
@@ -362,9 +526,13 @@ def _run_backtest_inner(db, months, output, min_months, horizon,
 
     site_mape = build_site_error_metrics(results_df)
 
-    overall_mape = results_df["error_pct"].mean()
-    overall_median_ape = results_df["error_pct"].median()
-    overall_trimmed_mape = site_mape["trimmed_mape_pct"].mean()
+    overall_mape = _finite_mean(results_df["error_pct"])
+    overall_me = _finite_mean(results_df["error"])
+    overall_mpe = _finite_mean(results_df["pct_error"])
+    overall_median_ape = pd.to_numeric(
+        results_df["error_pct"], errors="coerce"
+    ).replace([np.inf, -np.inf], np.nan).median()
+    overall_trimmed_mape = _finite_mean(site_mape["trimmed_mape_pct"])
     good = (site_mape["mape_pct"] < MAPE_GOOD_THRESHOLD).sum()
     acceptable = (
         (site_mape["mape_pct"] >= MAPE_GOOD_THRESHOLD)
@@ -375,7 +543,9 @@ def _run_backtest_inner(db, months, output, min_months, horizon,
     pct = lambda n: round(n * 100 / total_sites) if total_sites else 0
 
     print(f"Backtest: {months} months, {total_sites} sites\n")
-    print(f"Overall MAPE: {overall_mape:.1f}%\n")
+    print(f"Overall MAPE: {overall_mape:.1f}%")
+    print(f"Overall ME: {overall_me:+.1f} volume")
+    print(f"Overall MPE: {overall_mpe:+.1f}%\n")
     print(f"Median APE (all site-month rows): {overall_median_ape:.1f}%")
     print(f"Trimmed MAPE (drop each site's worst month): {overall_trimmed_mape:.1f}%\n")
     print(f"  MAPE < 5%:  {good:>4} sites ({pct(good)}%) - Good")
@@ -386,8 +556,16 @@ def _run_backtest_inner(db, months, output, min_months, horizon,
         summary_df = pd.DataFrame(
             [
                 {"metric": "overall_mape_pct", "value": round(float(overall_mape), 4)},
-                {"metric": "overall_median_ape_pct", "value": round(float(overall_median_ape), 4)},
-                {"metric": "overall_trimmed_mape_pct", "value": round(float(overall_trimmed_mape), 4)},
+                {"metric": "overall_me", "value": round(float(overall_me), 4)},
+                {"metric": "overall_mpe_pct", "value": round(float(overall_mpe), 4)},
+                {
+                    "metric": "overall_median_ape_pct",
+                    "value": round(float(overall_median_ape), 4),
+                },
+                {
+                    "metric": "overall_trimmed_mape_pct",
+                    "value": round(float(overall_trimmed_mape), 4),
+                },
                 {"metric": "sites_total", "value": int(total_sites)},
                 {"metric": "sites_good_lt_5_count", "value": int(good)},
                 {"metric": "sites_acceptable_5_to_10_count", "value": int(acceptable)},

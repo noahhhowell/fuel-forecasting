@@ -182,7 +182,7 @@ When you use `--output`, the Excel report contains three sheets:
 | Sheet | Contents |
 |-------|----------|
 | Weights | Site-grade model weights (site_id, grade, model_name, weight, mape_pct, n_months) |
-| Per-Model MAPE | Backtest accuracy for each model at each site-grade |
+| Per-Model MAPE | Backtest accuracy and bias for each model at each site-grade (`mape_pct`, `me`, `mpe`) |
 | Interval Calibration | Residual distribution stats (std, p10, p90) per site-grade, site, grade, and globally |
 
 ### Input Validation
@@ -256,8 +256,11 @@ python backtest.py --horizon 3
 
 Holds out recent months, generates forecasts using only prior data, applies the same production sanity caps and YoY guardrails, and reports:
 - MAPE (mean absolute percentage error) per site
+- ME (mean signed error, in volume units) and MPE (mean signed percentage error)
 - Median APE across all site-month rows
 - Trimmed MAPE (per-site mean after dropping each site's single worst month)
+
+For ME and MPE, positive values mean the model is over-forecasting on average; negative values mean under-forecasting. Rows where actual volume is zero are excluded from MAPE/MPE because percentage error is undefined, but they still contribute to ME.
 
 Like calibration, backtest parameters are validated upfront — invalid values produce clear error messages.
 

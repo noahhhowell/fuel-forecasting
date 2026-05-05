@@ -57,7 +57,7 @@ The rest of this guide omits the `uv run` prefix for brevity.
 
 Put Excel/CSV exports from PDI into the `data/` folder, then load them.
 
-```bash
+```powershell
 # Single file (Excel skips first 4 rows by default to find headers on row 5)
 python cli.py load --file data/FuelVolume_2024.xlsx
 
@@ -77,15 +77,15 @@ Use `--replace` only with `--file` when you want to fully refresh the database. 
 
 If your Excel headers aren't on row 5, use `--header-row`:
 
-```bash
+```powershell
 python cli.py load --file data/custom.xlsx --header-row 0
 ```
 
-### One-time Access CSV replacement workflow
+### Access CSV replacement workflow
 
 If your source is the Access-merged CSV (`merged_access_2017_2026_h1.csv`), first transform it into the standard loader shape, then replace the database:
 
-```bash
+```powershell
 # 1. Normalize the Access CSV into the standard loader format
 python scripts/transform_access_csv.py --input merged_access_2017_2026_h1.csv --output data/normalized_access.csv
 
@@ -100,7 +100,7 @@ The transform step maps Access `product` values into the existing canonical grad
 
 ## Checking Status
 
-```bash
+```powershell
 # Quick summary
 python cli.py status
 
@@ -110,7 +110,7 @@ python cli.py status --detailed
 
 ## Generating Forecasts
 
-```bash
+```powershell
 # Basic forecast (printed to console)
 python cli.py forecast 2026-03
 
@@ -123,7 +123,7 @@ python cli.py forecast 2026-03 --output forecasts/2026-03.csv
 
 If calibration has been run for the same forecast horizon, forecasts automatically use the calibrated site-grade weights. To force the default fixed weights instead, add `--no-calibration`:
 
-```bash
+```powershell
 python cli.py forecast 2026-03 --no-calibration
 ```
 
@@ -154,7 +154,7 @@ If a forecast is changed by a sanity cap or YoY guardrail, interval columns are 
 
 ### Running Calibration
 
-```bash
+```powershell
 # Default: 12-month backtest, 2-month-ahead horizon
 python cli.py calibrate
 
@@ -200,7 +200,7 @@ Re-run calibration when:
 
 Export the database to CSV with optional filters:
 
-```bash
+```powershell
 # Everything
 python cli.py export --output fuel_data.csv
 
@@ -243,7 +243,7 @@ Main file has ENSEMBLE results only. Companion files are created alongside:
 
 Evaluate forecast accuracy against historical actuals:
 
-```bash
+```powershell
 # Test against last 6 months (default)
 python backtest.py
 
@@ -268,7 +268,7 @@ Like calibration, backtest parameters are validated upfront — invalid values p
 
 ### Recommended workflow (first time)
 
-```bash
+```powershell
 # 1. Load your data
 python cli.py load --directory ./data
 
@@ -284,7 +284,7 @@ python cli.py forecast 2026-04 --output forecasts/2026-04.xlsx
 
 ### Weekly data update workflow
 
-```bash
+```powershell
 # 1. Load new export from PDI
 python cli.py load --file data/FuelVolume_2026_H1.xlsx
 
@@ -297,7 +297,7 @@ python cli.py forecast 2026-04 --output forecasts/2026-04.xlsx
 
 ### Re-calibrate after loading several months of new data
 
-```bash
+```powershell
 python cli.py calibrate --months 12 --output calibration_report.xlsx
 ```
 
@@ -305,7 +305,7 @@ After any `load --replace`, recalibration is required because previous weights a
 
 ### Include sites with limited data
 
-```bash
+```powershell
 # Lower the threshold to 12 months
 python cli.py forecast 2026-03 --min-months 12 --output forecasts/lenient.xlsx
 
@@ -315,7 +315,7 @@ python cli.py forecast 2026-03 --include-all --output forecasts/all.xlsx
 
 ## Running Tests
 
-```bash
+```powershell
 # Run the full test suite
 uv run pytest
 
@@ -331,20 +331,11 @@ uv run pytest -k "test_ensemble"
 
 Tests use temporary databases with synthetic data — they don't touch `fuel_sales.db` or any real data.
 
-## Expected Runtimes
-
-Forecasts are generated per site-grade combination. For ~1,200 combos, expect 15-30 minutes.
-
 ## Best Practices
 
-1. Load data weekly after PDI exports
-2. Run `calibrate` after loading significant new data to keep weights fresh
-3. Use ENSEMBLE for production decisions
-4. Run `status --detailed` regularly to monitor data quality
-5. Require 24+ months of data for reliable forecasts
-6. Review the Skipped sheet to understand gaps
-7. Keep past forecasts for accuracy tracking
-8. Spot-check forecasts against recent actuals
+1. Review the Skipped sheet after each run to understand coverage gaps.
+2. Keep past forecast files for accuracy tracking over time.
+3. Spot-check forecasts against recent actuals before acting on them.
 
 ## Troubleshooting
 
@@ -357,7 +348,7 @@ pip install uv
 Install Python 3.9+ from python.org, then retry.
 
 ### Insufficient data errors
-```bash
+```powershell
 # See which sites have issues
 python cli.py status --detailed
 
@@ -378,9 +369,14 @@ Run PowerShell as Administrator.
 
 | Path | Purpose |
 |------|---------|
+| `cli.py` | CLI entrypoint for all commands (load/status/export/forecast/calibrate) |
+| `database.py` | SQLite reads/writes and Excel/CSV ingest |
+| `models.py` | ETS (Holt-Winters) and Seasonal Naive model implementations |
+| `forecaster.py` | Model selection and ensemble blending |
+| `calibrate.py` | Calibration module (learns site-grade weights and intervals) |
+| `backtest.py` | Backtesting module (evaluates forecast accuracy) |
+| `scripts/transform_access_csv.py` | Normalizer for Access-merged CSV exports |
 | `fuel_sales.db` | SQLite database (auto-created on first load) |
 | `data/` | Put PDI Excel/CSV exports here |
 | `forecasts/` | Forecast output files |
-| `calibrate.py` | Calibration module (learns site-grade weights) |
-| `backtest.py` | Backtesting module (evaluates forecast accuracy) |
 | `tests/` | Automated test suite (run with `uv run pytest`) |

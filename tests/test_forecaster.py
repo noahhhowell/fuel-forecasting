@@ -128,15 +128,15 @@ class TestOutlierHandling:
         )
         assert (data["volume"] >= 0).all()
 
-    def test_short_series_skips_spike_detection(self):
-        """_detect_spikes should be a no-op on very short series."""
+    def test_short_series_skips_outlier_detection(self):
+        """Outlier detection should be a no-op on very short series."""
         fc = FuelForecaster(database=None, min_months_data=24)
         df = pd.DataFrame({
             "date": pd.date_range("2024-01", periods=3, freq="MS"),
             "volume": [100.0, 200.0, 9999.0],
         })
-        result = fc._detect_spikes(df.copy(), "test")
-        # With < 4 rows, spikes are not touched
+        result = fc._handle_outliers(df.copy(), site_id="100")
+        # With < 4 rows, outliers are not touched
         assert result["volume"].iloc[-1] == 9999.0
 
 
@@ -647,8 +647,8 @@ class TestSanityCaps:
             }
         }
         raw = self._make_monthly_data([500] * 24)
-        capped, unclamped, label, upper, lower = fc._apply_sanity_caps(
-            5000.0, "S1", "UNL", bounds, raw,
+        capped, unclamped, label, upper, lower, _yoy = fc._apply_bounds(
+            5000.0, "S1", "UNL", bounds, raw, prior_year_volume=None,
         )
         assert capped == 3000.0
         assert unclamped == 5000.0
@@ -665,8 +665,8 @@ class TestSanityCaps:
             }
         }
         raw = self._make_monthly_data([500] * 24)
-        capped, unclamped, label, upper, lower = fc._apply_sanity_caps(
-            5.0, "S1", "UNL", bounds, raw,
+        capped, unclamped, label, upper, lower, _yoy = fc._apply_bounds(
+            5.0, "S1", "UNL", bounds, raw, prior_year_volume=None,
         )
         assert capped == 20.0
         assert unclamped == 5.0
@@ -684,8 +684,8 @@ class TestSanityCaps:
             }
         }
         raw = self._make_monthly_data([300] * 6)
-        capped, unclamped, label, upper, lower = fc._apply_sanity_caps(
-            8000.0, "NEW1", "DSL", bounds, raw,
+        capped, unclamped, label, upper, lower, _yoy = fc._apply_bounds(
+            8000.0, "NEW1", "DSL", bounds, raw, prior_year_volume=None,
         )
         assert capped == 6000.0
         assert label == "upper_cap"
@@ -708,8 +708,8 @@ class TestSanityCaps:
         # Trend-widened cap: 3 * min(extrapolated, 2000)
         # polyfit slope is ~200/month, extrapolated forward by ~5 months = 2000
         # ceiling clips to 2000, so trend upper = 3*2000 = 6000
-        capped, unclamped, label, upper, lower = fc._apply_sanity_caps(
-            2000.0, "NEW2", "UNL", bounds, raw,
+        capped, unclamped, label, upper, lower, _yoy = fc._apply_bounds(
+            2000.0, "NEW2", "UNL", bounds, raw, prior_year_volume=None,
         )
         # 2000 < trend-widened cap, so no cap should fire
         assert label == ""
@@ -720,20 +720,27 @@ class TestSanityCaps:
     def test_yoy_cap_applied(self):
         """Forecast > 3x prior year should be capped to 3x."""
         fc = self._make_forecaster()
-        capped, label = fc._apply_yoy_guardrails(4000.0, 1000.0)
+        # Empty bounds -> no sanity clamp, isolating the YoY guardrail.
+        capped, _unclamped, _sanity, _upper, _lower, yoy_label = fc._apply_bounds(
+            4000.0, "S1", "UNL", {}, None, prior_year_volume=1000.0,
+        )
         assert capped == 3000.0
-        assert label == "yoy_upper"
+        assert yoy_label == "yoy_upper"
 
     def test_yoy_skipped_no_prior_year(self):
         """No prior year data -> YoY skipped."""
         fc = self._make_forecaster()
-        capped, label = fc._apply_yoy_guardrails(5000.0, None)
+        capped, _, _, _, _, yoy_label = fc._apply_bounds(
+            5000.0, "S1", "UNL", {}, None, prior_year_volume=None,
+        )
         assert capped == 5000.0
-        assert label == ""
+        assert yoy_label == ""
 
-        capped2, label2 = fc._apply_yoy_guardrails(5000.0, 0.0)
+        capped2, _, _, _, _, yoy_label2 = fc._apply_bounds(
+            5000.0, "S1", "UNL", {}, None, prior_year_volume=0.0,
+        )
         assert capped2 == 5000.0
-        assert label2 == ""
+        assert yoy_label2 == ""
 
     def test_no_cap_normal_forecast(self):
         """Forecast within bounds: untouched, unclamped == clamped."""
@@ -746,8 +753,8 @@ class TestSanityCaps:
             }
         }
         raw = self._make_monthly_data([500] * 24)
-        capped, unclamped, label, upper, lower = fc._apply_sanity_caps(
-            1500.0, "S1", "UNL", bounds, raw,
+        capped, unclamped, label, upper, lower, _yoy = fc._apply_bounds(
+            1500.0, "S1", "UNL", bounds, raw, prior_year_volume=None,
         )
         assert capped == 1500.0
         assert unclamped == 1500.0

@@ -379,72 +379,30 @@ class FuelForecaster:
         self, data: pd.DataFrame, site_id: Optional[str] = None
     ) -> pd.DataFrame:
         """
-        Detect and handle outliers using rolling-window MAD method.
+        Detect and cap outliers using a single rolling-window MAD method.
 
-        Uses a rolling window (last 18 months) to compute statistics, which adapts
-        to legitimate business changes (growth, new customers, etc.) while still
-        catching true data errors (typos, system glitches).
+        Robust (median/MAD) bounds are computed over the trailing
+        OUTLIER_WINDOW_MONTHS, which adapts to legitimate business changes
+        (growth, new customers) while catching true data errors (typos, glitches).
+        The upper bound additionally respects a per-month spike ceiling
+        (SPIKE_MULTIPLIER x local rolling median) so a one-month spike is caught
+        even when the window MAD is wide.
 
-        Sustained level shifts (3+ consecutive trailing months all outside bounds)
-        are detected and protected from clipping, as they represent real business
+        Sustained level shifts (LEVEL_SHIFT_MIN_TRAILING+ consecutive trailing
+        months outside the bounds) are preserved, as they represent real business
         changes like high-speed diesel upgrades or new store ramp-ups.
 
-        Outliers are capped at boundaries rather than removed to preserve time series continuity.
+        Outliers are capped at the boundary rather than removed to preserve
+        time-series continuity.
         """
         df = data.copy()
         site_label = f"Site {site_id}" if site_id else "Dataset"
 
-        window_size = min(OUTLIER_WINDOW_MONTHS, len(df))
-
-        # Phase 1: cap extreme spikes relative to rolling median
-        df = self._detect_spikes(df, site_label)
-
-        # Phase 2: MAD-based outlier detection on the (now spike-free) tail
-        df = self._detect_mad_outliers(df, window_size, site_label)
-
-        return df
-
-    # -- outlier sub-routines --------------------------------------------------
-
-    def _detect_spikes(self, df: pd.DataFrame, site_label: str) -> pd.DataFrame:
-        """Cap single-month volume spikes that exceed SPIKE_MULTIPLIER x rolling median."""
         if len(df) < 4:
             return df
 
-        rolling_median = (
-            df["volume"]
-            .rolling(window=SPIKE_ROLLING_WINDOW, min_periods=1)
-            .median()
-            .replace(0, np.nan)
-        )
-        spike_cap = rolling_median * SPIKE_MULTIPLIER
-        spike_mask = df["volume"] > spike_cap.fillna(df["volume"].max() * 2)
-
-        if spike_mask.any():
-            trailing = self._count_trailing_true(spike_mask)
-            if trailing >= LEVEL_SHIFT_MIN_TRAILING:
-                spike_mask.iloc[-trailing:] = False
-                logger.info(
-                    f"  {site_label}: Step-change detected - preserving "
-                    f"trailing {trailing} month(s) from spike cap"
-                )
-
-        if spike_mask.any():
-            capped = int(spike_mask.sum())
-            df.loc[spike_mask, "volume"] = spike_cap[spike_mask].fillna(
-                df["volume"].median()
-            )
-            logger.info(
-                f"  {site_label}: Capped {capped} spike(s) at "
-                f"{SPIKE_MULTIPLIER}x rolling median"
-            )
-
-        return df
-
-    def _detect_mad_outliers(
-        self, df: pd.DataFrame, window_size: int, site_label: str
-    ) -> pd.DataFrame:
-        """Detect and clip outliers using a rolling-window MAD method."""
+        # Robust MAD bounds over the trailing window.
+        window_size = min(OUTLIER_WINDOW_MONTHS, len(df))
         recent_volumes = df.tail(window_size)["volume"].values
         median = np.median(recent_volumes)
         MAD = np.median(np.abs(recent_volumes - median))
@@ -456,15 +414,29 @@ class FuelForecaster:
             lower_bound = max(0.0, median - MAD_LOWER_MULTIPLIER * MAD)
             upper_bound = median + MAD_UPPER_MULTIPLIER * MAD
 
+        # Per-month spike ceiling relative to the local rolling median: catches a
+        # single extreme month even when the window MAD bound is wide.  The
+        # effective upper bound per month is the tighter of the two.
+        rolling_median = (
+            df["volume"]
+            .rolling(window=SPIKE_ROLLING_WINDOW, min_periods=1)
+            .median()
+            .replace(0, np.nan)
+        )
+        spike_ceiling = (rolling_median * SPIKE_MULTIPLIER).fillna(
+            df["volume"].max() * 2
+        )
+        effective_upper = np.minimum(upper_bound, spike_ceiling.values)
+
         volumes = df["volume"].values
-        outlier_mask = (volumes < lower_bound) | (volumes > upper_bound)
+        outlier_mask = (volumes < lower_bound) | (volumes > effective_upper)
 
         trailing = self._count_trailing_true(outlier_mask)
         if trailing >= LEVEL_SHIFT_MIN_TRAILING:
             outlier_mask[-trailing:] = False
             logger.info(
                 f"  {site_label}: Step-change detected - preserving "
-                f"trailing {trailing} month(s) from MAD bounds "
+                f"trailing {trailing} month(s) from outlier bounds "
                 f"[{lower_bound:.0f}, {upper_bound:.0f}]"
             )
 
@@ -472,9 +444,9 @@ class FuelForecaster:
         outlier_count = len(outlier_indices)
 
         if outlier_count > 0:
-            df.loc[outlier_indices, "volume"] = df.loc[
-                outlier_indices, "volume"
-            ].clip(lower=lower_bound, upper=upper_bound)
+            df.loc[outlier_indices, "volume"] = np.clip(
+                volumes[outlier_mask], lower_bound, effective_upper[outlier_mask]
+            )
 
             outlier_dates = (
                 df.loc[outlier_indices, "date"].dt.strftime("%Y-%m").tolist()
@@ -1079,81 +1051,78 @@ class FuelForecaster:
 
         return bounds
 
-    def _apply_sanity_caps(
+    def _apply_bounds(
         self,
         forecast_value: float,
         site_id: str,
         grade: str,
         bounds: Dict[tuple, Dict[str, Any]],
         monthly_data_raw: Optional[pd.DataFrame],
-    ) -> Tuple[float, float, str, float, float]:
-        """Clamp *forecast_value* to precomputed sanity bounds.
+        prior_year_volume: Optional[float] = None,
+    ) -> Tuple[float, float, str, float, float, str]:
+        """Clamp *forecast_value* to its sanity bounds and YoY guardrails in one step.
 
-        For new (non-mature) sites with >=3 months of data, the upper cap
-        is widened using trend extrapolation so that legitimately ramping
-        sites aren't neutered.
+        Sanity bounds come from the site's own history (mature sites) or grade-cohort
+        stats (new sites); for new sites with >=3 months of data the upper bound is
+        widened via trend extrapolation so legitimately ramping sites aren't neutered.
+        YoY guardrails then constrain the result to [LOWER, UPPER] x the prior-year
+        actual (skipped when *prior_year_volume* is missing or <= 0).  Applying
+        sanity-then-YoY is equivalent to clamping to the intersection of the two
+        bounds; YoY wins on the rare conflicting-bound case, matching prior behavior.
 
         Returns:
-            (capped_value, unclamped_value, label, upper_cap_value, lower_floor_value)
+            (final_value, unclamped_value, sanity_label, upper_cap_value,
+             lower_floor_value, yoy_label)
         """
-        key = (str(site_id), str(grade))
-        info = bounds.get(key)
-        if info is None:
-            return forecast_value, forecast_value, "", float("inf"), 0.0
-
-        upper_cap = info["upper_cap"]
-        lower_floor = info["lower_floor"]
-
-        # Trend-aware widening for new sites
-        if not info["is_mature"] and monthly_data_raw is not None and len(monthly_data_raw) >= 3:
-            recent = monthly_data_raw.tail(min(6, len(monthly_data_raw)))
-            try:
-                x = np.arange(len(recent))
-                slope = float(np.polyfit(x, recent["volume"].values, 1)[0])
-                if slope > 0:
-                    months_ahead = len(monthly_data_raw)  # rough extrapolation distance
-                    extrapolated = float(recent["volume"].iloc[-1]) + slope * months_ahead
-                    most_recent = float(recent["volume"].iloc[-1])
-                    # Cap extrapolation at TREND_EXTRAP_CEILING_MULT * most recent
-                    extrapolated = min(extrapolated, TREND_EXTRAP_CEILING_MULT * most_recent)
-                    trend_upper = SANITY_CAP_UPPER_MULT * extrapolated
-                    if trend_upper > upper_cap:
-                        upper_cap = trend_upper
-            except Exception:
-                pass
-
         unclamped = forecast_value
-        label = ""
+        info = bounds.get((str(site_id), str(grade)))
+
+        # --- Sanity bounds ---
+        if info is None:
+            upper_cap, lower_floor = float("inf"), 0.0
+        else:
+            upper_cap = info["upper_cap"]
+            lower_floor = info["lower_floor"]
+
+            # Trend-aware widening for new sites
+            if not info["is_mature"] and monthly_data_raw is not None and len(monthly_data_raw) >= 3:
+                recent = monthly_data_raw.tail(min(6, len(monthly_data_raw)))
+                try:
+                    x = np.arange(len(recent))
+                    slope = float(np.polyfit(x, recent["volume"].values, 1)[0])
+                    if slope > 0:
+                        months_ahead = len(monthly_data_raw)  # rough extrapolation distance
+                        extrapolated = float(recent["volume"].iloc[-1]) + slope * months_ahead
+                        most_recent = float(recent["volume"].iloc[-1])
+                        # Cap extrapolation at TREND_EXTRAP_CEILING_MULT * most recent
+                        extrapolated = min(extrapolated, TREND_EXTRAP_CEILING_MULT * most_recent)
+                        trend_upper = SANITY_CAP_UPPER_MULT * extrapolated
+                        if trend_upper > upper_cap:
+                            upper_cap = trend_upper
+                except Exception:
+                    pass
+
+        sanity_label = ""
         if forecast_value > upper_cap:
             forecast_value = upper_cap
-            label = "upper_cap"
+            sanity_label = "upper_cap"
         elif forecast_value < lower_floor:
             forecast_value = lower_floor
-            label = "lower_floor"
+            sanity_label = "lower_floor"
 
-        return forecast_value, unclamped, label, upper_cap, lower_floor
+        # --- YoY guardrails (applied to the sanity-clamped value) ---
+        yoy_label = ""
+        if prior_year_volume is not None and not pd.isna(prior_year_volume) and prior_year_volume > 0:
+            yoy_upper = prior_year_volume * YOY_GUARD_UPPER_RATIO
+            yoy_lower = prior_year_volume * YOY_GUARD_LOWER_RATIO
+            if forecast_value > yoy_upper:
+                forecast_value = yoy_upper
+                yoy_label = "yoy_upper"
+            elif forecast_value < yoy_lower:
+                forecast_value = yoy_lower
+                yoy_label = "yoy_lower"
 
-    def _apply_yoy_guardrails(
-        self, forecast_value: float, prior_year_volume: Optional[float]
-    ) -> Tuple[float, str]:
-        """Clamp forecast to YoY guardrail range.
-
-        Skipped entirely when *prior_year_volume* is None or <= 0.
-
-        Returns:
-            (capped_value, label)
-        """
-        if prior_year_volume is None or pd.isna(prior_year_volume) or prior_year_volume <= 0:
-            return forecast_value, ""
-
-        upper = prior_year_volume * YOY_GUARD_UPPER_RATIO
-        lower = prior_year_volume * YOY_GUARD_LOWER_RATIO
-
-        if forecast_value > upper:
-            return upper, "yoy_upper"
-        if forecast_value < lower:
-            return lower, "yoy_lower"
-        return forecast_value, ""
+        return forecast_value, unclamped, sanity_label, upper_cap, lower_floor, yoy_label
 
     def _apply_caps_to_forecast_df(
         self,
@@ -1161,7 +1130,7 @@ class FuelForecaster:
         sanity_bounds: Dict[tuple, Dict[str, Any]],
         monthly_data_raw: Optional[pd.DataFrame],
     ) -> pd.DataFrame:
-        """Apply sanity caps and YoY guardrails to ENSEMBLE rows in *forecast_df*."""
+        """Apply sanity bounds and YoY guardrails to ENSEMBLE rows in *forecast_df*."""
         df = forecast_df.copy()
 
         # Initialize new columns with defaults
@@ -1174,38 +1143,27 @@ class FuelForecaster:
         ensemble_mask = df["model"] == "ENSEMBLE"
         for idx in df.index[ensemble_mask]:
             row = df.loc[idx]
-            site_id = str(row["site_id"])
-            grade = str(row["grade"])
-            vol = float(row["forecast_volume"])
+            prior = row.get("prior_year_volume")
+            prior_val = float(prior) if prior is not None and not pd.isna(prior) else None
 
-            # Sanity caps
-            vol, unclamped, sanity_label, upper_val, lower_val = self._apply_sanity_caps(
-                vol, site_id, grade, sanity_bounds, monthly_data_raw,
+            vol, unclamped, sanity_label, upper_val, lower_val, yoy_label = self._apply_bounds(
+                float(row["forecast_volume"]), str(row["site_id"]), str(row["grade"]),
+                sanity_bounds, monthly_data_raw, prior_year_volume=prior_val,
             )
+
             df.at[idx, "forecast_volume"] = vol
             df.at[idx, "forecast_volume_unclamped"] = unclamped
             df.at[idx, "sanity_cap_applied"] = sanity_label
             df.at[idx, "upper_cap_value"] = upper_val if np.isfinite(upper_val) else pd.NA
             df.at[idx, "lower_floor_value"] = lower_val
+            df.at[idx, "yoy_cap_applied"] = yoy_label
 
-            # YoY guardrails
-            prior_year_vol = row.get("prior_year_volume")
-            if prior_year_vol is not None and not pd.isna(prior_year_vol):
-                vol_after_yoy, yoy_label = self._apply_yoy_guardrails(vol, float(prior_year_vol))
-                if yoy_label:
-                    df.at[idx, "forecast_volume"] = vol_after_yoy
-                    df.at[idx, "yoy_cap_applied"] = yoy_label
-                    # Recalculate YoY change after capping
-                    if "yoy_change_pct" in df.columns:
-                        df.at[idx, "yoy_change_pct"] = self._calculate_yoy_change(
-                            vol_after_yoy, prior_year_vol
-                        )
-            else:
-                df.at[idx, "yoy_cap_applied"] = ""
+            # Recalculate YoY change after a YoY cap fires
+            if yoy_label and prior_val and "yoy_change_pct" in df.columns:
+                df.at[idx, "yoy_change_pct"] = self._calculate_yoy_change(vol, prior_val)
 
-            # If any cap fired, clip p10/p90 to the effective bounds
-            final_vol = float(df.at[idx, "forecast_volume"])
-            if final_vol != unclamped:
+            # If any cap fired, clip p10/p90 to the effective sanity bounds
+            if vol != unclamped:
                 for pcol in ("forecast_p10", "forecast_p90"):
                     if pcol in df.columns and pd.notna(df.at[idx, pcol]):
                         pval = float(df.at[idx, pcol])
@@ -1220,11 +1178,11 @@ class FuelForecaster:
                     and "forecast_p90" in df.columns
                     and pd.notna(df.at[idx, "forecast_p10"])
                     and pd.notna(df.at[idx, "forecast_p90"])
-                    and final_vol > 0
+                    and vol > 0
                 ):
                     p10 = float(df.at[idx, "forecast_p10"])
                     p90 = float(df.at[idx, "forecast_p90"])
-                    df.at[idx, "interval_width_pct"] = (p90 - p10) / final_vol * 100
+                    df.at[idx, "interval_width_pct"] = (p90 - p10) / vol * 100
 
         return df
 

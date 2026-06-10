@@ -372,6 +372,54 @@ class TestSummarySheets:
         assert len(summary) == 1
         assert summary["forecast_volume"].iloc[0] > 0
 
+    @staticmethod
+    def _make_grade_rows(priors):
+        """One site with one ENSEMBLE row per grade and the given prior volumes."""
+        grades = ["UNL", "DSL"]
+        return pd.DataFrame([
+            {
+                "model": "ENSEMBLE", "site_id": "A", "grade": grade,
+                "target_month": "2025-03", "forecast_volume": vol,
+                "prior_year_volume": prior,
+            }
+            for grade, vol, prior in zip(grades, [1000.0, 500.0], priors)
+        ])
+
+    def test_site_summary_partial_prior_year_is_na(self):
+        """A site missing prior-year data for one grade gets NA prior/YoY, not a partial sum."""
+        fc = FuelForecaster(database=None, min_months_data=24)
+        forecasts = self._make_grade_rows([900.0, np.nan])
+
+        summary = fc._create_site_summary(forecasts)
+        row = summary.iloc[0]
+
+        assert row["forecast_volume"] == pytest.approx(1500.0)
+        assert pd.isna(row["prior_year_volume"])
+        assert pd.isna(row["yoy_change_pct"])
+
+    def test_site_summary_full_prior_year_sums(self):
+        """With prior-year data for every grade, prior sum and YoY are computed."""
+        fc = FuelForecaster(database=None, min_months_data=24)
+        forecasts = self._make_grade_rows([900.0, 600.0])
+
+        summary = fc._create_site_summary(forecasts)
+        row = summary.iloc[0]
+
+        assert row["forecast_volume"] == pytest.approx(1500.0)
+        assert row["prior_year_volume"] == pytest.approx(1500.0)
+        assert row["yoy_change_pct"] == pytest.approx(0.0)
+
+    def test_site_summary_all_missing_prior_year_is_na(self):
+        """A site with no prior-year data at all gets NA, not a zero sum."""
+        fc = FuelForecaster(database=None, min_months_data=24)
+        forecasts = self._make_grade_rows([np.nan, np.nan])
+
+        summary = fc._create_site_summary(forecasts)
+        row = summary.iloc[0]
+
+        assert pd.isna(row["prior_year_volume"])
+        assert pd.isna(row["yoy_change_pct"])
+
 
 # ---------------------------------------------------------------------------
 # Export (file output)
@@ -795,6 +843,83 @@ class TestSanityCaps:
         assert row["yoy_cap_applied"] == "yoy_upper"
         assert float(row["forecast_volume"]) == pytest.approx(4500.0)
         assert float(row["forecast_volume_unclamped"]) == pytest.approx(10000.0)
+
+    def _make_capped_forecast_df(self, p10, p90, width_pct, risk_flag):
+        """ENSEMBLE row whose forecast (10000) will exceed an upper cap."""
+        return pd.DataFrame([{
+            "model": "ENSEMBLE",
+            "forecast_volume": 10000.0,
+            "site_id": "S1",
+            "grade": "UNL",
+            "target_month": "2025-03",
+            "prior_year_volume": None,
+            "yoy_change_pct": None,
+            "forecast_p10": p10,
+            "forecast_p90": p90,
+            "interval_width_pct": width_pct,
+            "risk_flag": risk_flag,
+        }])
+
+    def test_risk_flag_cleared_when_clipped_width_below_threshold(self):
+        """Cap clipping that collapses the interval should clear a stale HIGH flag."""
+        fc = self._make_forecaster()
+        forecast_df = self._make_capped_forecast_df(
+            p10=9000.0, p90=14000.0, width_pct=50.0, risk_flag="HIGH",
+        )
+        bounds = {
+            ("S1", "UNL"): {
+                "upper_cap": 5000.0, "lower_floor": 10.0, "is_mature": True,
+            }
+        }
+        raw = self._make_monthly_data([500] * 24)
+
+        result = fc._apply_caps_to_forecast_df(forecast_df, bounds, raw)
+        row = result.iloc[0]
+
+        assert float(row["forecast_volume"]) == pytest.approx(5000.0)
+        # p10/p90 both clipped to the cap -> zero width -> flag cleared
+        assert float(row["interval_width_pct"]) == pytest.approx(0.0)
+        assert row["risk_flag"] == ""
+
+    def test_risk_flag_set_when_clipped_width_above_threshold(self):
+        """If the recomputed width still exceeds the threshold, flag becomes HIGH."""
+        fc = self._make_forecaster()
+        forecast_df = self._make_capped_forecast_df(
+            p10=1000.0, p90=14000.0, width_pct=130.0, risk_flag="",
+        )
+        bounds = {
+            ("S1", "UNL"): {
+                "upper_cap": 5000.0, "lower_floor": 10.0, "is_mature": True,
+            }
+        }
+        raw = self._make_monthly_data([500] * 24)
+
+        result = fc._apply_caps_to_forecast_df(forecast_df, bounds, raw)
+        row = result.iloc[0]
+
+        # p10 stays 1000, p90 clipped to 5000 -> width = 80% of capped volume
+        assert float(row["interval_width_pct"]) == pytest.approx(80.0)
+        assert row["risk_flag"] == "HIGH"
+
+    def test_risk_flag_untouched_without_intervals(self):
+        """With missing p10/p90 the width is not recomputed, so the flag is left as-is."""
+        fc = self._make_forecaster()
+        forecast_df = self._make_capped_forecast_df(
+            p10=pd.NA, p90=pd.NA, width_pct=pd.NA, risk_flag="HIGH",
+        )
+        bounds = {
+            ("S1", "UNL"): {
+                "upper_cap": 5000.0, "lower_floor": 10.0, "is_mature": True,
+            }
+        }
+        raw = self._make_monthly_data([500] * 24)
+
+        result = fc._apply_caps_to_forecast_df(forecast_df, bounds, raw)
+        row = result.iloc[0]
+
+        assert float(row["forecast_volume"]) == pytest.approx(5000.0)
+        assert pd.isna(row["interval_width_pct"])
+        assert row["risk_flag"] == "HIGH"
 
 
 class TestReviewSheet:

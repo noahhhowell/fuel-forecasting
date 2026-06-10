@@ -232,8 +232,12 @@ python backtest.py --horizon 3
 
 Holds out recent months, generates forecasts using only prior data, and reports:
 - MAPE (mean absolute percentage error) per site
+- ME (mean signed error, in volume units) and MPE (mean signed percentage error)
 - Median APE across all site-month rows
 - Trimmed MAPE (per-site mean after dropping each site's single worst month)
+- Site ratings based on trimmed MAPE, so one anomalous month does not dominate the rating
+
+For ME and MPE, positive values mean the model is over-forecasting on average; negative values mean under-forecasting.
 
 Like calibration, backtest parameters are validated upfront — invalid values produce clear error messages.
 

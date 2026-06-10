@@ -1172,7 +1172,7 @@ class FuelForecaster:
                             pval = min(pval, upper_val)
                         pval = max(pval, lower_val)
                         df.at[idx, pcol] = pval
-                # Recalculate interval width
+                # Recalculate interval width and risk flag
                 if (
                     "forecast_p10" in df.columns
                     and "forecast_p90" in df.columns
@@ -1182,7 +1182,12 @@ class FuelForecaster:
                 ):
                     p10 = float(df.at[idx, "forecast_p10"])
                     p90 = float(df.at[idx, "forecast_p90"])
-                    df.at[idx, "interval_width_pct"] = (p90 - p10) / vol * 100
+                    width_pct = (p90 - p10) / vol * 100
+                    df.at[idx, "interval_width_pct"] = width_pct
+                    if "risk_flag" in df.columns:
+                        df.at[idx, "risk_flag"] = (
+                            "HIGH" if width_pct > self.RISK_THRESHOLD_PCT else ""
+                        )
 
         return df
 
@@ -1454,6 +1459,19 @@ class FuelForecaster:
 
         # Recalculate YoY change based on summed values
         if "prior_year_volume" in site_summary.columns:
+            # A summed prior year is misleading when any grade is missing its
+            # prior-year actual, so blank the prior year (and YoY) for those sites.
+            prior_missing = (
+                grade_data.groupby(group_cols)["prior_year_volume"]
+                .agg(lambda s: s.isna().any())
+                .reset_index(name="_prior_missing")
+            )
+            site_summary = site_summary.merge(prior_missing, on=group_cols, how="left")
+            site_summary.loc[
+                site_summary["_prior_missing"].astype(bool), "prior_year_volume"
+            ] = np.nan
+            site_summary = site_summary.drop(columns="_prior_missing")
+
             site_summary["yoy_change_pct"] = site_summary.apply(
                 lambda row: self._calculate_yoy_change(
                     row["forecast_volume"], row["prior_year_volume"]

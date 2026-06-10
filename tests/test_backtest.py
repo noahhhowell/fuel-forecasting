@@ -34,7 +34,7 @@ class TestBuildSiteErrorMetrics:
         site_metrics = build_site_error_metrics(results)
 
         expected_cols = {
-            "site_id", "mape_pct", "median_ape_pct",
+            "site_id", "mape_pct", "me", "mpe", "median_ape_pct",
             "trimmed_mape_pct", "max_ape_pct", "n_months", "rating",
         }
         assert expected_cols.issubset(site_metrics.columns)
@@ -82,19 +82,40 @@ class TestBuildSiteErrorMetrics:
         assert site_metrics.empty
         assert "rating" in site_metrics.columns
 
-    def test_rating_uses_threshold_constants(self):
-        """Rating column should respect the MAPE threshold constants."""
+    def test_rating_uses_trimmed_mape_thresholds(self):
+        """Rating should use trimmed MAPE, not raw mean MAPE."""
         results = pd.DataFrame(
             [
                 {"site_id": "A", "month": "2025-01", "error_pct": MAPE_GOOD_THRESHOLD - 1},
+                {"site_id": "A", "month": "2025-02", "error_pct": 100.0},
                 {"site_id": "B", "month": "2025-01", "error_pct": MAPE_GOOD_THRESHOLD + 1},
+                {"site_id": "B", "month": "2025-02", "error_pct": 100.0},
                 {"site_id": "C", "month": "2025-01", "error_pct": MAPE_ACCEPTABLE_THRESHOLD + 1},
+                {"site_id": "C", "month": "2025-02", "error_pct": 100.0},
             ]
         )
         metrics = build_site_error_metrics(results).set_index("site_id")
+        assert metrics.loc["A", "mape_pct"] > MAPE_ACCEPTABLE_THRESHOLD
         assert str(metrics.loc["A", "rating"]) == "Good"
         assert str(metrics.loc["B", "rating"]) == "Acceptable"
         assert str(metrics.loc["C", "rating"]) == "Review"
+
+    def test_signed_error_metrics(self):
+        """ME/MPE should preserve over- vs under-forecast direction."""
+        results = pd.DataFrame(
+            [
+                {"site_id": "A", "forecast": 110.0, "actual": 100.0},
+                {"site_id": "A", "forecast": 90.0, "actual": 100.0},
+                {"site_id": "B", "forecast": 80.0, "actual": 100.0},
+            ]
+        )
+        metrics = build_site_error_metrics(results).set_index("site_id")
+
+        assert metrics.loc["A", "mape_pct"] == pytest.approx(10.0)
+        assert metrics.loc["A", "me"] == pytest.approx(0.0)
+        assert metrics.loc["A", "mpe"] == pytest.approx(0.0)
+        assert metrics.loc["B", "me"] == pytest.approx(-20.0)
+        assert metrics.loc["B", "mpe"] == pytest.approx(-20.0)
 
 
 # ---------------------------------------------------------------------------
@@ -130,9 +151,10 @@ class TestRunBacktest:
 
         assert results_df is not None
         assert not results_df.empty
-        assert {"site_id", "month", "forecast", "actual", "error_pct"}.issubset(
-            results_df.columns
-        )
+        assert {
+            "site_id", "month", "forecast", "actual",
+            "signed_error", "signed_error_pct", "error_pct",
+        }.issubset(results_df.columns)
 
         assert site_mape is not None
         assert not site_mape.empty
@@ -194,7 +216,8 @@ class TestRunBacktest:
         assert per_model_df is not None
         assert not per_model_df.empty
         assert {"site_id", "month", "model", "forecast", "actual",
-                "error_pct", "residual"}.issubset(per_model_df.columns)
+                "signed_error", "signed_error_pct", "error_pct",
+                "residual"}.issubset(per_model_df.columns)
 
     def test_return_per_model_false_returns_pair(self, db):
         """return_per_model=False (default) should return a 2-tuple."""
@@ -221,11 +244,32 @@ class TestBuildPerModelSiteMetrics:
         ])
         metrics = build_per_model_site_metrics(df)
         assert len(metrics) == 3
-        assert {"site_id", "model", "mape_pct", "n_months"}.issubset(metrics.columns)
+        assert {"site_id", "model", "mape_pct", "me", "mpe", "n_months"}.issubset(
+            metrics.columns
+        )
 
         ets_100 = metrics[(metrics["site_id"] == "100") & (metrics["model"] == "ets")]
         assert ets_100["mape_pct"].iloc[0] == pytest.approx(6.0)
         assert ets_100["n_months"].iloc[0] == 2
+
+    def test_computes_signed_model_metrics(self):
+        """Per-model metrics should include signed bias columns."""
+        df = pd.DataFrame([
+            {"site_id": "100", "model": "ets", "forecast": 110.0, "actual": 100.0},
+            {"site_id": "100", "model": "ets", "forecast": 90.0, "actual": 100.0},
+            {"site_id": "100", "model": "snaive", "forecast": 80.0, "actual": 100.0},
+        ])
+
+        metrics = build_per_model_site_metrics(df)
+        ets_100 = metrics[(metrics["site_id"] == "100") & (metrics["model"] == "ets")]
+        snaive_100 = metrics[
+            (metrics["site_id"] == "100") & (metrics["model"] == "snaive")
+        ]
+
+        assert ets_100["me"].iloc[0] == pytest.approx(0.0)
+        assert ets_100["mpe"].iloc[0] == pytest.approx(0.0)
+        assert snaive_100["me"].iloc[0] == pytest.approx(-20.0)
+        assert snaive_100["mpe"].iloc[0] == pytest.approx(-20.0)
 
     def test_empty_input(self):
         """Empty input should return empty DataFrame with correct schema."""

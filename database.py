@@ -147,21 +147,21 @@ class FuelDatabase:
         logger.info(f"Database initialized: {self.db_path}")
 
     def load_from_excel(self, file_path: str) -> dict:
-        """Load data from Excel file with automatic deduplication"""
+        """Load data from Excel file, replacing existing rows on duplicate keys"""
         logger.info(f"Loading: {file_path}")
         df = pd.read_excel(file_path, skiprows=self.header_row)
         logger.info(f"  Read {len(df):,} rows from Excel")
         return self._load_dataframe(df, file_path)
 
     def load_from_csv(self, file_path: str) -> dict:
-        """Load data from CSV file with automatic deduplication"""
+        """Load data from CSV file, replacing existing rows on duplicate keys"""
         logger.info(f"Loading: {file_path}")
         df = pd.read_csv(file_path)
         logger.info(f"  Read {len(df):,} rows from CSV")
         return self._load_dataframe(df, file_path)
 
     def _load_dataframe(self, df: pd.DataFrame, file_path: str) -> dict:
-        """Normalize columns, validate, and insert rows with deduplication"""
+        """Normalize columns, validate, and upsert rows (REPLACE on duplicate keys)"""
         total_rows = len(df)
         df.columns = df.columns.str.strip()
         column_map = self._build_column_mapping(df.columns)
@@ -211,7 +211,7 @@ class FuelDatabase:
         records = df[db_cols].itertuples(index=False, name=None)
 
         sql = """
-            INSERT OR IGNORE INTO sales (
+            INSERT OR REPLACE INTO sales (
                 site_id, grade, day, brand, site, address, city, state,
                 owner, b_unit, stock, delivered, volume, is_estimated,
                 total_sales, target
@@ -231,7 +231,7 @@ class FuelDatabase:
         )
         self.conn.commit()
 
-        logger.info(f"  Inserted: {inserted:,} | Duplicates skipped: {duplicates:,}")
+        logger.info(f"  Inserted: {inserted:,} | Existing rows replaced: {duplicates:,}")
 
         return {
             "file": Path(file_path).name,

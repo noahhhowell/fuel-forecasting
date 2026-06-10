@@ -100,8 +100,8 @@ class TestDataLoading:
         finally:
             db.close()
 
-    def test_duplicate_rows_are_skipped(self, tmp_path):
-        """Loading the same data twice should skip duplicates."""
+    def test_duplicate_rows_are_replaced_not_doubled(self, tmp_path):
+        """Loading the same data twice should replace rows, not add new ones."""
         csv_path = tmp_path / "test.csv"
         csv_path.write_text(
             "site_id,grade,day,volume,is_estimated\n"
@@ -115,6 +115,31 @@ class TestDataLoading:
             assert first["inserted"] == 1
             assert second["inserted"] == 0
             assert second["duplicates"] == 1
+        finally:
+            db.close()
+
+    def test_reload_applies_corrected_values(self, tmp_path):
+        """Re-loading a row with the same key but corrected volume updates it."""
+        csv_path = tmp_path / "test.csv"
+        csv_path.write_text(
+            "site_id,grade,day,volume,is_estimated\n"
+            "999,UNL,2024-01-01,500.0,0\n"
+        )
+
+        db = FuelDatabase(str(tmp_path / "reload_test.db"))
+        try:
+            db.load_from_csv(str(csv_path))
+            csv_path.write_text(
+                "site_id,grade,day,volume,is_estimated\n"
+                "999,UNL,2024-01-01,650.0,0\n"
+            )
+            stats = db.load_from_csv(str(csv_path))
+            assert stats["inserted"] == 0
+            assert stats["duplicates"] == 1
+
+            data = db.get_sales_data(site_ids=["999"])
+            assert len(data) == 1
+            assert data["volume"].iloc[0] == 650.0
         finally:
             db.close()
 

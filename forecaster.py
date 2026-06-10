@@ -192,13 +192,13 @@ class FuelForecaster:
         self,
         forecast: float,
         site_id: Optional[str] = None,
-        grade: Optional[str] = None,
         risk_threshold: float = None,
     ) -> Dict[str, Any]:
         """
         Compute prediction intervals from calibrated residual distributions.
 
-        Shrinkage fallback: site -> grade -> global.
+        Shrinkage fallback: site -> global. (Calibration only writes
+        "site:*" and "global" segments.)
         Returns dict with forecast_p10, forecast_p90, interval_width_pct, risk_flag.
         Returns empty values if no calibration data exists.
         """
@@ -209,9 +209,6 @@ class FuelForecaster:
         # Try site-level first
         if site_id:
             factors = self._get_interval_factors(f"site:{site_id}")
-        # Try grade-level fallback if that segment exists
-        if factors is None and grade and grade != "ALL":
-            factors = self._get_interval_factors(f"grade:{grade}")
         # Try global
         if factors is None:
             factors = self._get_interval_factors("global")
@@ -1006,7 +1003,7 @@ class FuelForecaster:
 
             # Compute prediction intervals for the ensemble
             intervals = self._compute_intervals(
-                ensemble_forecast, site_id=site_id, grade=grade,
+                ensemble_forecast, site_id=site_id,
             )
             ensemble_row_data.update(intervals)
 
